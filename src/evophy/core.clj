@@ -54,17 +54,46 @@
         (list op (random-expression (dec depth)))
         (list op (random-expression (dec depth)) (random-expression (dec depth)))))))
 
+(defn- state-sensitivity
+  "Mean max(|∂f/∂q|, |∂f/∂p|) approximated with tiny (q,p) bumps; ~0 for literals in (q,p)."
+  [func data]
+  (let [samples (take 32 data)
+        n (count samples)]
+    (if (zero? n)
+      0.0
+      (/ (double
+          (reduce
+           (fn [acc {:keys [q p]}]
+             (+ acc
+                (let [q (double q)
+                      p (double p)
+                      eps (* 1e-7 (max 1.0 (+ (Math/abs q) (Math/abs p))))
+                      f0 (double (func q p))
+                      dq (/ (Math/abs (- (double (func (+ q eps) p)) f0)) eps)
+                      dp (/ (Math/abs (- (double (func q (+ p eps))) f0)) eps)]
+                  (max dq dp))))
+           0.0
+           samples))
+         n))))
+
 (defn calculate-fitness [expr data]
   (try
-    (let [;; Compile the S-expression into a Clojure function
-          func (eval `(fn [~'q ~'p] ~expr))
+    (let [func (binding [*ns* (the-ns 'evophy.core)]
+                  (eval `(fn [~'q ~'p] ~expr)))
           values (map (fn [{:keys [q p]}] (func q p)) data)
-          mean (/ (reduce + values) (count values))
-          variance (/ (reduce + (map #(e/square (- % mean)) values)) (count values))
-          cv (/ (Math/sqrt variance) (+ (Math/abs mean) 1e-6))]
-      ;; Higher fitness when coefficient of variation is low (stable law vs scale).
-      (/ 1.0 (+ cv 1e-6)))
-    (catch Exception e 0))) ;; If the formula does something illegal (div by zero), fitness is 0
+          n (count values)]
+      (if (zero? n)
+        0
+        (let [mean (/ (reduce + values) n)
+              variance (/ (reduce + (map #(e/square (- % mean)) values)) n)
+              cv (/ (Math/sqrt variance) (+ (Math/abs mean) 1e-6))
+              sens (state-sensitivity func data)]
+          ;; Low CV favors conserved-like quantities; sensitivity zeros out pure
+          ;; constants (flat in q,p) without requiring particular symbols in the tree.
+          (if (< sens 1e-9)
+            0
+            (* (/ 1.0 (+ cv 1e-6)) (Math/sqrt sens))))))
+    (catch Exception _ 0)))
 
 (defn mutate [expr]
   (if (< (rand) 0.2)
@@ -75,7 +104,7 @@
 
 (defn evolve-generation
   ([population data]
-   (evolve-generation population data 30))
+   (evolve-generation population data 50))
   ([population data population-size]
    (let [elite-n (max 1 (quot population-size 5))
          branch-factor (long (Math/ceil (/ population-size (double elite-n))))]
@@ -89,7 +118,19 @@
                                 (repeatedly #(mutate (:expr parent)))))))
           (take population-size)))))
 
-(defn -main [& args]
+(defn- take-distinct-by
+  "Walk coll in order; keep at most n items whose (key-fn x) has not been seen."
+  [key-fn n coll]
+  (loop [seen #{} out [] xs (seq coll)]
+    (if (or (= (count out) n) (nil? xs))
+      out
+      (let [x (first xs)
+            k (key-fn x)]
+        (if (contains? seen k)
+          (recur seen out (rest xs))
+          (recur (conj seen k) (conj out x) (rest xs)))))))
+
+(defn -main [& _args]
   ;; Emmy logs ODE compile at INFO; keep default for REPL, quiet for `lein run`.
   (timbre/merge-config! {:min-level :warn})
   (let [data      (generate-data 1.0 1.0 1.0 0.0 0.1 100)
@@ -97,8 +138,9 @@
         final-pop (reduce (fn [pop _] (evolve-generation pop data 50))
                           initial
                           (range 50))
-        best      (->> final-pop
+        top3      (->> final-pop
                        (map (fn [expr] {:expr expr :fitness (calculate-fitness expr data)}))
                        (sort-by :fitness >)
-                       first)]
-    (println (:expr best))))
+                       (take-distinct-by :expr 3))]
+    (doseq [{:keys [expr]} top3]
+      (println expr))))
