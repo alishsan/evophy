@@ -11,3 +11,29 @@ pom.xml.asc
 /.prepl-port
 .hgignore
 .hg/
+
+# Editors and language servers
+.clj-kondo/
+.lsp/
+.idea/
+*.iml
+.vscode/
+.calva/
+
+# Clojure CLI (when used next to Leiningen)
+.cpcache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env and secrets
+.env
+.env.local
+.env.*.local
+
+# Editor backups
+*~
+*.swp
+*.swo
+.#*
