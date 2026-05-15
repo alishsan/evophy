@@ -1,7 +1,8 @@
 
 (ns evophy.core
   (:gen-class)
-  (:require [emmy.env :as e]
+  (:require [clojure.edn :as edn]
+            [emmy.env :as e]
             [taoensso.timbre :as timbre]))
 
 (defn ho-hamiltonian [m k]
@@ -21,6 +22,23 @@
            (let [[t q p] (vec state)]
              {:t t :q q :p p :energy (h state)}))
          trajectory)))
+
+(defn scenario-data
+  "Trajectory for one training scenario (map with :m :k :q0 :p0 :dt :steps)."
+  [{:keys [m k q0 p0 dt steps]}]
+  (vec (generate-data m k q0 p0 dt steps)))
+
+(def default-scenarios
+  "Diverse harmonic-oscillator setups—like many AlphaZero games with different openings."
+  [{:id :displaced-q :m 1.0 :k 1.0 :q0 1.0 :p0 0.0 :dt 0.1 :steps 100}
+   {:id :displaced-p :m 1.0 :k 1.0 :q0 0.0 :p0 1.0 :dt 0.1 :steps 100}
+   {:id :heavy-m      :m 2.0 :k 1.0 :q0 0.8 :p0 0.5 :dt 0.1 :steps 100}
+   {:id :stiff-k      :m 1.0 :k 2.0 :q0 0.5 :p0 0.5 :dt 0.1 :steps 100}
+   {:id :mixed-phase  :m 1.0 :k 1.0 :q0 0.7 :p0 0.7 :dt 0.05 :steps 80}])
+
+(defn scenarios->datasets
+  [scenarios]
+  (mapv scenario-data scenarios))
 
 (defn- compile-rate-fn [expr]
   (binding [*ns* (the-ns 'evophy.core)]
@@ -126,6 +144,15 @@
             (* quality speed-factor)))))
     (catch Exception _ 0)))
 
+(defn calculate-fitness-scenarios
+  "Mean fitness across many trajectories—laws must generalize, not overfit one IC."
+  [dq-expr dp-expr datasets]
+  (let [fits (mapv #(calculate-fitness dq-expr dp-expr %) datasets)
+        n (count fits)]
+    (if (zero? n)
+      0
+      (/ (reduce + 0.0 fits) n))))
+
 (defn mutate [expr]
   (if (< (rand) 0.2)
     (random-expression 2)
@@ -139,36 +166,125 @@
     {:dq (mutate dq) :dp (mutate dp)}))
 
 
+(def default-population-file "data/population.edn")
+(def checkpoint-version 1)
+
+(defn- individual-for-save [{:keys [dq dp]}]
+  {:dq dq :dp dp})
+
+(defn save-population!
+  "Write population to path (creates parent dirs). Omits :fitness; it is recomputed on load."
+  [path population & {:keys [generations-run population-size]}]
+  (let [f (java.io.File. path)]
+    (.mkdirs (.getParentFile f))
+    (spit path
+          (pr-str {:version checkpoint-version
+                   :population-size (or population-size (count population))
+                   :generations-run (long (or generations-run 0))
+                   :population (mapv individual-for-save population)}))))
+
+(defn load-population
+  "Load checkpoint from path, or nil if missing / invalid."
+  [path]
+  (let [f (java.io.File. path)]
+    (when (.exists f)
+      (try
+        (let [{:keys [version population generations-run population-size]}
+              (edn/read-string (slurp path))]
+          (when (= version checkpoint-version)
+            {:population (vec population)
+             :generations-run (long (or generations-run 0))
+             :population-size population-size}))
+        (catch Exception e
+          (timbre/warn "Could not load population from" path "-" (.getMessage e))
+          nil)))))
+
+(defn normalize-population-size
+  "Pad with random individuals or trim so size matches the configured target."
+  [population target-size]
+  (let [n (count population)]
+    (cond
+      (zero? target-size) []
+      (<= n target-size) (into population (repeatedly (- target-size n) random-individual))
+      :else (subvec (vec population) 0 target-size))))
+
+(defn resolve-initial-population
+  [{:keys [fresh? path population-size]}]
+  (if fresh?
+    {:population (vec (repeatedly population-size random-individual))
+     :generations-run 0
+     :resumed? false}
+    (if-let [{:keys [population generations-run]} (load-population path)]
+      {:population population
+       :generations-run generations-run
+       :resumed? true}
+      {:population (vec (repeatedly population-size random-individual))
+       :generations-run 0
+       :resumed? false})))
+
+(defn parse-args
+  [args]
+  (loop [opts {:fresh? false
+               :path default-population-file
+               :generations 50
+               :population-size 50}
+         xs args]
+    (if (empty? xs)
+      opts
+      (let [[a & more] xs]
+        (case a
+          "--fresh" (recur (assoc opts :fresh? true) more)
+          "--population" (recur (assoc opts :path (first more)) (rest more))
+          "--generations" (recur (assoc opts :generations (Long/parseLong (first more))) (rest more))
+          "--population-size" (recur (assoc opts :population-size (Long/parseLong (first more))) (rest more))
+          (throw (ex-info "Unknown argument (try --fresh --population PATH --generations N --population-size N)"
+                          {:arg a})))))))
+
 (defn evolve-generation
-  [population data population-size]
+  [population datasets population-size]
   (let [elite-n (max 1 (quot population-size 5))
         branch-factor (long (Math/ceil (/ population-size (double elite-n))))]
     (->> population
          (map (fn [ind]
-                (assoc ind :fitness (calculate-fitness (:dq ind) (:dp ind) data))))
+                (assoc ind :fitness (calculate-fitness-scenarios (:dq ind) (:dp ind) datasets))))
          (sort-by :fitness >)
          (take elite-n)
          (mapcat (fn [parent]
-                   ;; Create a vector containing the parent + mutants
-                   (cons parent 
-                         (take (dec branch-factor) 
+                   (cons parent
+                         (take (dec branch-factor)
                                (repeatedly #(mutate-individual parent))))))
          (take population-size)
-         (vec)))) ;; Ensure it returns a vector for the next generation
+         (vec))))
 
-(defn -main [& _args]
+(defn -main [& args]
   (timbre/merge-config! {:min-level :warn})
-  (let [data (vec (generate-data 1.0 2.0 1.0 0.0 0.1 100))
-        initial (vec (repeatedly 50 random-individual))
-        final-pop (reduce (fn [pop _] (evolve-generation pop data 50))
+  (let [{:keys [fresh? path generations population-size]} (parse-args args)
+        scenarios default-scenarios
+        datasets (scenarios->datasets scenarios)
+        {:keys [population generations-run resumed?]}
+        (resolve-initial-population {:fresh? fresh?
+                                     :path path
+                                     :population-size population-size})
+        initial (normalize-population-size population population-size)
+        final-pop (reduce (fn [pop _] (evolve-generation pop datasets population-size))
                           initial
-                          (range 50))
+                          (range generations))
+        total-generations (+ generations-run generations)
         best (->> final-pop
                   (map (fn [ind]
-                         (assoc ind :fitness (calculate-fitness (:dq ind) (:dp ind) data))))
+                         (assoc ind :fitness (calculate-fitness-scenarios (:dq ind) (:dp ind) datasets))))
                   (sort-by :fitness >)
                   first)]
+    (save-population! path final-pop
+                      :generations-run total-generations
+                      :population-size population-size)
+    (println (if resumed? "resumed from" "started new; saved to") path)
+    (println "total generations (cumulative):" total-generations)
+    (println "scenarios:" (count scenarios))
     (println "dq/dt:" (:dq best))
     (println "dp/dt:" (:dp best))
-    (println "fitness:" (:fitness best))
-    (println "predictions:" (evaluate-predictions (:dq best) (:dp best) data))))
+    (println "mean fitness:" (:fitness best))
+    (doseq [scenario scenarios]
+      (let [data (scenario-data scenario)
+            metrics (evaluate-predictions (:dq best) (:dp best) data)]
+        (println (str "  " (:id scenario) " mse=" (format "%.6f" (:mse metrics))))))))

@@ -37,3 +37,6 @@ Thumbs.db
 *.swp
 *.swo
 .#*
+
+# Evolved populations (local checkpoints)
+data/population.edn
