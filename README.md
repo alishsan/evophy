@@ -1,44 +1,42 @@
 # evophy
 
-FIXME: description
+Small Clojure experiment: evolve symbolic expressions that behave like **conserved quantities** along a synthetic **harmonic-oscillator** trajectory. Ground-truth dynamics come from **[Emmy](https://github.com/mentat-collective/emmy/)** (Hamiltonian integration); a simple genetic program searches over trees built from `+`, `-`, `*`, `e/square`, coordinates `q` / `p`, and numeric constants.
 
-## Installation
+Repository: [https://github.com/alishsan/evophy](https://github.com/alishsan/evophy)
 
-Download from http://example.com/FIXME.
+## Requirements
 
-## Usage
+- [Leiningen](https://leiningen.org/) 2.x
+- JDK 11+ (tested with typical OpenJDK installs)
 
-FIXME: explanation
+## Quick start
 
-    $ java -jar evophy-0.1.0-standalone.jar [args]
+Clone the repo, then from the project root:
 
-## Options
+```bash
+lein test
+lein run
+```
 
-FIXME: listing of options this app accepts.
+`lein run` integrates the reference oscillator, runs the GA for several generations, then prints the best individual’s **expression**, **fitness**, and a **result** map (`:mean` / `:variance` of the law over the trajectory samples).
 
-## Examples
+## Tests
 
-...
+```bash
+lein test
+```
 
-### Bugs
+Covers trajectory generation and fitness behavior (e.g. flat literals vs state-dependent laws).
 
-...
+## Uberjar (optional)
 
-### Any Other Sections
-### That You Think
-### Might be Useful
+```bash
+lein uberjar
+java -jar target/uberjar/evophy-*-standalone.jar
+```
+
+Version in the filename follows Leiningen’s default (`0.1.0-SNAPSHOT` until you release).
 
 ## License
 
-Copyright © 2026 FIXME
-
-This program and the accompanying materials are made available under the
-terms of the Eclipse Public License 2.0 which is available at
-http://www.eclipse.org/legal/epl-2.0.
-
-This Source Code may also be made available under the following Secondary
-Licenses when the conditions for such availability set forth in the Eclipse
-Public License, v. 2.0 are satisfied: GNU General Public License as published by
-the Free Software Foundation, either version 2 of the License, or (at your
-option) any later version, with the GNU Classpath Exception which is available
-at https://www.gnu.org/software/classpath/license.html.
+This project is licensed under the **Eclipse Public License 2.0** (EPL-2.0). The full license text is in [`LICENSE`](LICENSE).
