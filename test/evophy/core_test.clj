@@ -3,6 +3,32 @@
             [clojure.test :refer :all]
             [evophy.core :refer :all]))
 
+(defn- dataset
+  "Wrap raw trajectory with scenario parameters for fitness APIs."
+  [m alpha data]
+  {:m m :alpha alpha :data data})
+
+(def ^:private r-cubed
+  "r³ from current position (qx, qy)."
+  '(* (e/sqrt (+ (e/square qx) (e/square qy)))
+      (e/square (e/sqrt (+ (e/square qx) (e/square qy))))))
+
+(def ^:private true-grav-rates
+  "Hamiltonian rates: q̇ = p/m, ṗ = −α q/r³."
+  {:strategy :differential
+   :dqx-expr '(e/div px m)
+   :dqy-expr '(e/div py m)
+   :dpx-expr (list '* -1.0 (list '* 'alpha (list 'e/div 'qx r-cubed)))
+   :dpy-expr (list '* -1.0 (list '* 'alpha (list 'e/div 'qy r-cubed)))})
+
+(def ^:private wrong-grav-rates
+  "Uses m and α but wrong dependence on state."
+  {:strategy :differential
+   :dqx-expr '(* qx m)
+   :dqy-expr '(* qy m)
+   :dpx-expr '(* px alpha)
+   :dpy-expr '(* py alpha)})
+
 (deftest generate-data-smoke
   (testing "2D gravitational trajectory has expected length"
     (is (= 101 (count (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 100)))))))
@@ -14,83 +40,70 @@
     (is (not= (first qs) (last qs)))))
 
 (deftest calculate-fitness-smoke-gravitational
-  (let [data (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20))
+  (let [ds (dataset 1.0 1.0 (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20)))
         ind (random-analytical-individual)]
-    (is (number? (calculate-fitness ind data)))))
+    (is (number? (calculate-fitness ind ds)))))
 
 (deftest t-only-analytical-laws-score-zero
-  (let [data (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20))
+  (let [ds (dataset 1.0 1.0 (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20)))
         cheat {:strategy :analytical
                :qx-expr '(e/sin t) :qy-expr '(e/sin t)
                :px-expr '(e/cos t) :py-expr '(e/cos t)}]
     (testing "laws that ignore ICs are rejected"
-      (is (zero? (calculate-fitness cheat data))))))
+      (is (zero? (calculate-fitness cheat ds))))))
 
 (deftest analytical-missing-ic-symbol-scores-zero
-  (let [data (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20))
+  (let [ds (dataset 1.0 1.0 (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20)))
         cheat {:strategy :analytical
                :qx-expr '(e/sin t)
                :qy-expr '(e/sin t)
                :px-expr '(e/sin t)
                :py-expr '(e/sin t)}]
     (testing "laws that never use p0x are rejected"
-      (is (zero? (calculate-fitness cheat data))))))
+      (is (zero? (calculate-fitness cheat ds))))))
 
 (deftest analytical-exprs-must-use-time
-  (let [data (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20))
+  (let [ds (dataset 1.0 1.0 (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20)))
         static {:strategy :analytical
                 :qx-expr '(e/square (* p0x q0x))
                 :qy-expr '(e/square (* p0y q0y))
-                :px-expr '(* t p0x q0x)
-                :py-expr '(* t p0y q0y)}]
+                :px-expr '(* t p0x q0x m)
+                :py-expr '(* t p0y q0y alpha)}]
     (testing "qx with no t is rejected"
-      (is (zero? (calculate-fitness static data))))))
-
-(def ^:private r0cubed
-  "r₀³ with q0x/q0y only (no syntax-quote — avoids namespaced symbols in compiled fns)."
-  '(* (e/sqrt (+ (e/square q0x) (e/square q0y)))
-      (e/square (e/sqrt (+ (e/square q0x) (e/square q0y))))))
+      (is (zero? (calculate-fitness static ds))))))
 
 (deftest differential-fitness-favors-true-gravitational-rates
-  "At t0 with m=α=1: q̇x=p0x, q̇y=p0y, ṗx=−q0x/r₀³, ṗy=−q0y/r₀³."
-  (let [data (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20))
-        true-ind {:strategy :differential
-                  :dqx-expr 'p0x
-                  :dqy-expr 'p0y
-                  :dpx-expr (list '* -1.0 (list 'e/div 'q0x r0cubed))
-                  :dpy-expr (list '* -1.0 (list 'e/div 'q0y r0cubed))}
-        flat-ind {:strategy :differential
-                  :dqx-expr 'q0x :dqy-expr 'q0y :dpx-expr 'p0x :dpy-expr 'p0y}]
-    (testing "true 2D gravitational rates beat wrong linear rates"
-      (is (pos? (calculate-fitness true-ind data)))
-      (is (> (calculate-fitness true-ind data)
-             (calculate-fitness flat-ind data))))))
+  (let [ds (dataset 1.0 1.0 (vec (generate-data 1.0 1.0 2.5 0.0 0.0 0.35 0.05 20)))]
+    (testing "true parameterized rates beat wrong rates"
+      (is (pos? (calculate-fitness true-grav-rates ds)))
+      (is (> (calculate-fitness true-grav-rates ds)
+             (calculate-fitness wrong-grav-rates ds))))))
 
 (deftest multi-scenario-fitness-generalizes-true-rates
-  (let [datasets (scenarios->datasets (take 3 default-scenarios))
-        true-ind {:strategy :differential
-                  :dqx-expr 'p0x
-                  :dqy-expr 'p0y
-                  :dpx-expr '(* -1.0 (e/div q0x r0cubed))
-                  :dpy-expr '(* -1.0 (e/div q0y r0cubed))}
-        flat-ind {:strategy :differential
-                  :dqx-expr 'q0x :dqy-expr 'q0y :dpx-expr 'p0x :dpy-expr 'p0y}
-        true-fit (calculate-fitness-scenarios true-ind datasets)
-        flat-fit (calculate-fitness-scenarios flat-ind datasets)]
-    (testing "true rates beat constants on worst scenario"
-      (is (> true-fit flat-fit)))
+  (let [datasets (scenarios->datasets default-scenarios)
+        true-fit (calculate-fitness-scenarios true-grav-rates datasets)
+        wrong-fit (calculate-fitness-scenarios wrong-grav-rates datasets)]
+    (testing "true rates beat wrong rates on worst scenario"
+      (is (> true-fit wrong-fit)))
     (testing "each scenario dataset is non-empty"
-      (is (every? #(pos? (count %)) datasets)))))
+      (is (every? #(pos? (count (:data %))) datasets)))))
+
+(deftest true-rates-fit-heavy-m-scenario
+  (let [ds (scenario-data {:m 2.0 :alpha 1.0 :q0x 2.2 :q0y 1.0 :p0x 0.1 :p0y 0.25 :dt 0.04 :steps 40})]
+    (is (pos? (calculate-fitness true-grav-rates ds)))))
+
+(deftest mutate-produces-printable-expressions
+  (let [tree '(+ (e/square qx) (* py m))
+        mutated (mutate tree differential-vars)]
+    (is (list? mutated))
+    (is (not (instance? clojure.lang.LazySeq mutated)))))
 
 (deftest population-persistence-roundtrip
   (let [path (str (io/file (System/getProperty "java.io.tmpdir")
                            (str "evophy-pop-" (System/nanoTime) ".edn")))
         pop [{:strategy :analytical
               :qx-expr 'p0x :qy-expr 'p0y :px-expr 't :py-expr 't}
-             {:strategy :differential
-              :dqx-expr 'p0x :dqy-expr 'p0y
-              :dpx-expr '(* -1.0 (e/div q0x (e/square q0x)))
-              :dpy-expr '(* -1.0 (e/div q0y (e/square q0y)))}]]
+             true-grav-rates]]
     (try
       (save-population! path pop :generations-run 12 :population-size 2)
       (is (= 12 (:generations-run (load-population path))))

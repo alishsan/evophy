@@ -111,8 +111,11 @@
                             core/analytical-expr-keys))))))))
 
 (defn- state->individual [state]
-  (into {:strategy :analytical}
-        (map (fn [k] [k (get state k)]) core/analytical-expr-keys)))
+  (-> (into {:strategy :analytical}
+            (map (fn [k] [k (get state k)]) core/analytical-expr-keys))
+      (core/ensure-symbol-coverage core/analytical-expr-keys
+                                   core/required-analytical-symbols)
+      core/ensure-analytical-uses-t))
 
 (defonce ^:private fitness-cache (atom {}))
 
@@ -155,7 +158,7 @@
 (defn- note-best! [best-atom ind datasets]
   (when (core/genome-valid? ind)
     (let [fit (fitness-for-individual ind datasets)]
-      (when (> fit (:fitness @best-atom))
+      (when (and (pos? fit) (> fit (:fitness @best-atom)))
         (reset! best-atom {:fitness fit :individual ind})))))
 
 (defn- expand! [node datasets _c best-atom]
@@ -199,7 +202,10 @@
           best (atom {:fitness -1.0 :individual nil})]
       (dotimes [_ simulations]
         (traverse root datasets c best))
-      (or (:individual @best) (core/random-analytical-individual)))))
+      (let [ind (or (when-let [i (:individual @best)]
+                      (when (core/genome-valid? i) i))
+                    (core/random-analytical-individual))]
+        (if (core/genome-valid? ind) ind (core/random-analytical-individual))))))
 
 (defn generation-inject
   [datasets simulations n]

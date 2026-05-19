@@ -1,5 +1,5 @@
 (defproject evophy "0.1.0-SNAPSHOT"
-  :description "Genetic search for conserved-like laws on Emmy harmonic-oscillator data"
+  :description "Evolve 2D gravitational rate laws and analytical trajectories via GP+MCTS"
   :url "https://github.com/alishsan/evophy"
   :license {:name "Eclipse Public License - v 2.0"
             :url "https://www.eclipse.org/legal/epl-2.0/"}

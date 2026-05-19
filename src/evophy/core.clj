@@ -57,9 +57,10 @@
           states)))
 
 (defn scenario-data
-  "Trajectory for one scenario (:m :alpha :q0x :q0y :p0x :p0y :dt :steps)."
-  [{:keys [m alpha q0x q0y p0x p0y dt steps]}]
-  (vec (generate-data m alpha q0x q0y p0x p0y dt steps)))
+  "Scenario map plus integrated :data trajectory (includes :m :alpha for fitness)."
+  [scenario]
+  (let [{:keys [m alpha q0x q0y p0x p0y dt steps]} scenario]
+    (assoc scenario :data (vec (generate-data m alpha q0x q0y p0x p0y dt steps)))))
 
 (def default-scenarios
   "2D gravitational ICs (|q| > 0, away from collision singularity)."
@@ -74,14 +75,18 @@
   (mapv scenario-data scenarios))
 
 (def ^:private ic-vars '[q0x q0y p0x p0y])
+(def ^:private state-vars '[qx qy px py])
+(def ^:private param-vars '[m alpha])
 
 (defn- compile-state-fn [expr]
   (binding [*ns* (the-ns 'evophy.core)]
-    (eval `(fn [~'t ~'q0x ~'q0y ~'p0x ~'p0y] ~(rewrite-div-in-expr expr)))))
+    (eval `(fn [~'t ~'q0x ~'q0y ~'p0x ~'p0y ~'m ~'alpha]
+             ~(rewrite-div-in-expr expr)))))
 
 (defn- compile-rate-fn [expr]
   (binding [*ns* (the-ns 'evophy.core)]
-    (eval `(fn [~'q0x ~'q0y ~'p0x ~'p0y] ~(rewrite-div-in-expr expr)))))
+    (eval `(fn [~'qx ~'qy ~'px ~'py ~'m ~'alpha]
+             ~(rewrite-div-in-expr expr)))))
 
 (defn- state-at-t [data t]
   (some (fn [s]
@@ -96,17 +101,19 @@
   (let [{:keys [qx qy px py]} (first data)]
     {:q0x (double qx) :q0y (double qy) :p0x (double px) :p0y (double py)}))
 
-(defn- horizon-errors-analytical [fns data horizon-times]
+(defn- horizon-errors-analytical [fns {:keys [data m alpha]} horizon-times]
   (let [{:keys [q0x q0y p0x p0y]} (initial-ics data)
+        md (double m)
+        ad (double alpha)
         {qx-fn :qx qy-fn :qy px-fn :px py-fn :py} fns]
     (reduce
      (fn [{:keys [sq-q sq-p n] :as acc} t]
        (if-let [{:keys [qx qy px py]} (state-at-t data t)]
          (let [td (double t)
-               pred-qx (double (qx-fn td q0x q0y p0x p0y))
-               pred-qy (double (qy-fn td q0x q0y p0x p0y))
-               pred-px (double (px-fn td q0x q0y p0x p0y))
-               pred-py (double (py-fn td q0x q0y p0x p0y))]
+               pred-qx (double (qx-fn td q0x q0y p0x p0y md ad))
+               pred-qy (double (qy-fn td q0x q0y p0x p0y md ad))
+               pred-px (double (px-fn td q0x q0y p0x p0y md ad))
+               pred-py (double (py-fn td q0x q0y p0x p0y md ad))]
            (-> acc
                (update :sq-q + (+ (e/square (- pred-qx qx))
                                   (e/square (- pred-qy qy))))
@@ -117,26 +124,34 @@
      {:sq-q 0.0 :sq-p 0.0 :n 0}
      horizon-times)))
 
-(defn- horizon-errors-differential [rate-fns data horizon-times]
-  (let [{:keys [q0x q0y p0x p0y]} (initial-ics data)
-        {dqx-fn :dqx dqy-fn :dqy dpx-fn :dpx dpy-fn :dpy} rate-fns]
-    (reduce
-     (fn [{:keys [sq-q sq-p n] :as acc} t]
-       (if-let [{:keys [qx qy px py]} (state-at-t data t)]
-         (let [td (double t)
-               dqx (double (dqx-fn q0x q0y p0x p0y))
-               dqy (double (dqy-fn q0x q0y p0x p0y))
-               dpx (double (dpx-fn q0x q0y p0x p0y))
-               dpy (double (dpy-fn q0x q0y p0x p0y))]
-           (-> acc
-               (update :sq-q + (+ (e/square (- (+ q0x (* dqx td)) qx))
-                                  (e/square (- (+ q0y (* dqy td)) qy))))
-               (update :sq-p + (+ (e/square (- (+ p0x (* dpx td)) px))
-                                  (e/square (- (+ p0y (* dpy td)) py))))
-               (update :n inc)))
-         acc))
-     {:sq-q 0.0 :sq-p 0.0 :n 0}
-     horizon-times)))
+(defn- predict-step-rates
+  "One Euler step from current (qx,qy,px,py) using evolved rate laws."
+  [{:keys [dqx dqy dpx dpy]} {:keys [qx qy px py]} dt m alpha]
+  (let [md (double m)
+        ad (double alpha)
+        dqx (double (dqx qx qy px py md ad))
+        dqy (double (dqy qx qy px py md ad))
+        dpx (double (dpx qx qy px py md ad))
+        dpy (double (dpy qx qy px py md ad))
+        dt (double dt)]
+    {:qx (+ (double qx) (* dqx dt))
+     :qy (+ (double qy) (* dqy dt))
+     :px (+ (double px) (* dpx dt))
+     :py (+ (double py) (* dpy dt))}))
+
+(defn- one-step-errors-differential [rate-fns {:keys [data m alpha]}]
+  (reduce
+   (fn [{:keys [sq-q sq-p n] :as acc} [s0 s1]]
+     (let [dt (- (double (:t s1)) (double (:t s0)))
+           pred (predict-step-rates rate-fns s0 dt m alpha)]
+       (-> acc
+           (update :sq-q + (+ (e/square (- (:qx pred) (:qx s1)))
+                              (e/square (- (:qy pred) (:qy s1)))))
+           (update :sq-p + (+ (e/square (- (:px pred) (:px s1)))
+                              (e/square (- (:py pred) (:py s1)))))
+           (update :n inc))))
+   {:sq-q 0.0 :sq-p 0.0 :n 0}
+   (partition 2 1 data)))
 
 (defn expr-uses-symbol? [expr sym]
   (cond
@@ -147,27 +162,51 @@
 (defn expr-uses-t? [expr]
   (expr-uses-symbol? expr 't))
 
-(defn expr-uses-all-ics? [expr]
-  (every? #(expr-uses-symbol? expr %) ic-vars))
-
 (def analytical-expr-keys [:qx-expr :qy-expr :px-expr :py-expr])
 (def differential-expr-keys [:dqx-expr :dqy-expr :dpx-expr :dpy-expr])
 
+(def required-analytical-symbols (into ic-vars param-vars))
+(def ^:private required-differential-symbols (into state-vars param-vars))
+
+(defn- symbols-covered-across-exprs? [expr-keys ind required-syms]
+  (every? (fn [sym]
+            (some #(expr-uses-symbol? (get ind %) sym) expr-keys))
+          required-syms))
+
+(defn- inject-symbol-into-expr [expr sym]
+  (list '+ expr sym))
+
+(defn ensure-symbol-coverage
+  "Add missing required symbols into random expr slots so genome-valid? can succeed."
+  [ind expr-keys required-syms]
+  (reduce
+   (fn [ind sym]
+     (if (symbols-covered-across-exprs? expr-keys ind [sym])
+       ind
+       (let [k (rand-nth expr-keys)]
+         (update ind k #(inject-symbol-into-expr % sym)))))
+   ind
+   required-syms))
+
+(defn ensure-analytical-uses-t [ind]
+  (into ind
+        (map (fn [k]
+               (let [expr (get ind k)]
+                 [k (if (expr-uses-t? expr) expr (list '+ 't expr))]))
+             analytical-expr-keys)))
+
 (defn- analytical-genome-valid? [ind]
   (and (every? #(expr-uses-t? (get ind %)) analytical-expr-keys)
-       (every? (fn [sym]
-                 (some #(expr-uses-symbol? (get ind %) sym) analytical-expr-keys))
-               ic-vars)))
+       (symbols-covered-across-exprs? analytical-expr-keys ind required-analytical-symbols)))
 
 (defn genome-valid?
-  "Analytical: each expr uses t; all ICs appear across qx/qy/px/py. Differential: ICs across rates."
+  "Analytical: each expr uses t; ICs and (m, α) appear across trajectory laws.
+   Differential: state coords and (m, α) appear across rate laws."
   [{:keys [strategy] :as ind}]
   (case strategy
     :analytical (analytical-genome-valid? ind)
-    :differential (every? (fn [sym]
-                            (some #(expr-uses-symbol? (get ind %) sym)
-                                  differential-expr-keys))
-                          ic-vars)
+    :differential (symbols-covered-across-exprs? differential-expr-keys ind
+                                                required-differential-symbols)
     false))
 
 (defn individual-genome-key [ind]
@@ -187,13 +226,14 @@
           (recur seen out (rest xs))
           (recur (conj seen k) (conj out ind) (rest xs)))))))
 
-(defn- evaluate-analytical-predictions [ind data]
+(defn- evaluate-analytical-predictions [ind dataset]
   (let [fns {:qx (compile-state-fn (:qx-expr ind))
              :qy (compile-state-fn (:qy-expr ind))
              :px (compile-state-fn (:px-expr ind))
              :py (compile-state-fn (:py-expr ind))}
+        {:keys [data]} dataset
         times (all-horizon-times data)
-        {:keys [sq-q sq-p n]} (horizon-errors-analytical fns data times)]
+        {:keys [sq-q sq-p n]} (horizon-errors-analytical fns dataset times)]
     (if (zero? n)
       {:strategy :analytical :n-horizons 0
        :mse-q Double/POSITIVE_INFINITY :mse-p Double/POSITIVE_INFINITY
@@ -202,13 +242,12 @@
         {:strategy :analytical :n-horizons (long n)
          :mse-q (/ sq-q n) :mse-p (/ sq-p n) :mse (/ (+ sq-q sq-p) n)}))))
 
-(defn- evaluate-differential-predictions [ind data]
+(defn- evaluate-differential-predictions [ind dataset]
   (let [fns {:dqx (compile-rate-fn (:dqx-expr ind))
              :dqy (compile-rate-fn (:dqy-expr ind))
              :dpx (compile-rate-fn (:dpx-expr ind))
              :dpy (compile-rate-fn (:dpy-expr ind))}
-        times (all-horizon-times data)
-        {:keys [sq-q sq-p n]} (horizon-errors-differential fns data times)]
+        {:keys [sq-q sq-p n]} (one-step-errors-differential fns dataset)]
     (if (zero? n)
       {:strategy :differential :n-horizons 0
        :mse-q Double/POSITIVE_INFINITY :mse-p Double/POSITIVE_INFINITY
@@ -218,16 +257,17 @@
          :mse-q (/ sq-q n) :mse-p (/ sq-p n) :mse (/ (+ sq-q sq-p) n)}))))
 
 (defn evaluate-predictions
-  "Horizon error for an individual genome vs integrated trajectory (all t > 0)."
-  [individual data]
+  "Horizon error for an individual genome vs integrated trajectory (all t > 0).
+   dataset is a scenario map with :data, :m, :alpha."
+  [individual dataset]
   (case (:strategy individual)
-    :analytical (evaluate-analytical-predictions individual data)
-    :differential (evaluate-differential-predictions individual data)
+    :analytical (evaluate-analytical-predictions individual dataset)
+    :differential (evaluate-differential-predictions individual dataset)
     {:mse Double/POSITIVE_INFINITY}))
 
 (def ops '[+ - * e/square e/sin e/cos e/div e/sqrt])
-(def analytical-vars (into '[t] ic-vars))
-(def differential-vars ic-vars)
+(def analytical-vars (vec (concat '[t] ic-vars param-vars)))
+(def differential-vars (vec (concat state-vars param-vars)))
 (def constants '[0.5 1.0 2.0])
 
 (def operators
@@ -259,32 +299,41 @@
                (random-expression (dec depth) vars)
                (random-expression (dec depth) vars)))))))
 
-(defn- random-valid-individual [genome-fn]
+(defn- random-valid-individual [genome-fn expr-keys required-syms valid?-fn]
   (loop [n 0]
-    (let [ind (genome-fn)]
+    (let [ind (-> (genome-fn)
+                  (ensure-symbol-coverage expr-keys required-syms))]
       (cond
-        (genome-valid? ind) ind
+        (valid?-fn ind) ind
         (> n 500) ind
         :else (recur (inc n))))))
 
 (defn random-analytical-individual []
   (random-valid-individual
-   #(into {:strategy :analytical}
-          (map (fn [k] [k (random-expression 4 analytical-vars)])
-               analytical-expr-keys))))
+   #(-> (into {:strategy :analytical}
+              (map (fn [k] [k (random-expression 4 analytical-vars)])
+                   analytical-expr-keys))
+        (ensure-symbol-coverage analytical-expr-keys required-analytical-symbols)
+        ensure-analytical-uses-t)
+   analytical-expr-keys
+   required-analytical-symbols
+   analytical-genome-valid?))
 
 (defn random-differential-individual []
   (random-valid-individual
    #(into {:strategy :differential}
           (map (fn [k] [k (random-expression 4 differential-vars)])
-               differential-expr-keys))))
+               differential-expr-keys))
+   differential-expr-keys
+   required-differential-symbols
+   #(genome-valid? %)))
 
 (defn random-individual []
   (if (< (rand) 0.5)
     (random-analytical-individual)
     (random-differential-individual)))
 
-(def terminals (vec (concat '[t] ic-vars [(fn [] (rand-nth [0.5 1.0 2.0]))])))
+(def terminals (vec (concat '[t] ic-vars param-vars [(fn [] (rand-nth [0.5 1.0 2.0]))])))
 
 (defn random-tree [max-depth]
   (if (or (zero? max-depth) (< (rand) 0.3))
@@ -309,33 +358,35 @@
           quality (/ 1.0 (+ rmse fitness-rmse-floor))]
       (* quality (or t-factor 1.0)))))
 
-(defn calculate-analytical-fitness [ind data]
+(defn calculate-analytical-fitness [ind dataset]
   (try
-      (when (analytical-genome-valid? ind)
-        (let [fns {:qx (compile-state-fn (:qx-expr ind))
+    (when (analytical-genome-valid? ind)
+      (let [{:keys [data]} dataset
+            fns {:qx (compile-state-fn (:qx-expr ind))
                  :qy (compile-state-fn (:qy-expr ind))
                  :px (compile-state-fn (:px-expr ind))
                  :py (compile-state-fn (:py-expr ind))}
-            errors (horizon-errors-analytical fns data (all-horizon-times data))]
+            errors (horizon-errors-analytical fns dataset (all-horizon-times data))]
         (fitness-from-errors errors :t-factor 1.15)))
     (catch Exception _ 0)))
 
-(defn calculate-differential-fitness [ind data]
+(defn calculate-differential-fitness [ind dataset]
   (try
     (when (genome-valid? ind)
       (let [fns {:dqx (compile-rate-fn (:dqx-expr ind))
                  :dqy (compile-rate-fn (:dqy-expr ind))
                  :dpx (compile-rate-fn (:dpx-expr ind))
                  :dpy (compile-rate-fn (:dpy-expr ind))}
-            errors (horizon-errors-differential fns data (all-horizon-times data))]
+            errors (one-step-errors-differential fns dataset)]
         (fitness-from-errors errors)))
     (catch Exception _ 0)))
 
 (defn calculate-fitness
-  [individual data]
+  "dataset is a scenario map with :data, :m, :alpha."
+  [individual dataset]
   (or (case (:strategy individual)
-        :analytical (calculate-analytical-fitness individual data)
-        :differential (calculate-differential-fitness individual data)
+        :analytical (calculate-analytical-fitness individual dataset)
+        :differential (calculate-differential-fitness individual dataset)
         nil)
       0))
 
@@ -347,14 +398,25 @@
       0
       (apply min fits))))
 
+(defn- normalize-expr
+  "GP trees must be plain lists for eval/print; mutate used to leave LazySeq subtrees."
+  [expr]
+  (cond
+    (instance? clojure.lang.LazySeq expr) (normalize-expr (doall expr))
+    (and (sequential? expr) (not (map? expr)))
+    (apply list (map normalize-expr expr))
+    :else expr))
+
 (defn mutate
   ([expr] (mutate expr analytical-vars))
   ([expr vars]
-   (if (< (rand) 0.2)
-     (random-expression 2 vars)
-     (if (coll? expr)
-       (map #(if (coll? %) (mutate % vars) %) expr)
-       expr))))
+   (normalize-expr
+    (if (< (rand) 0.2)
+      (random-expression 2 vars)
+      (if (coll? expr)
+        (let [op (first expr)]
+          (cons op (mapv #(if (coll? %) (mutate % vars) %) (rest expr))))
+        expr)))))
 
 (defn mutate-individual [ind]
   (if (< (rand) 0.2)
@@ -370,13 +432,15 @@
 
 
 (def default-population-file "data/population.edn")
-(def checkpoint-version 5)
+(def checkpoint-version 7)
 
 (defn- individual-for-save [ind]
-  (case (:strategy ind)
-    :analytical (select-keys ind (into [:strategy] analytical-expr-keys))
-    :differential (select-keys ind (into [:strategy] differential-expr-keys))
-    (select-keys ind (into [:strategy] (concat analytical-expr-keys differential-expr-keys)))))
+  (let [norm (fn [k] [k (normalize-expr (get ind k))])]
+    (case (:strategy ind)
+      :analytical (into {:strategy :analytical} (map norm analytical-expr-keys))
+      :differential (into {:strategy :differential} (map norm differential-expr-keys))
+      (into {:strategy (:strategy ind)}
+            (map norm (concat analytical-expr-keys differential-expr-keys))))))
 
 (defn save-population!
   "Write population to path (creates parent dirs). Omits :fitness; it is recomputed on load."
@@ -518,14 +582,14 @@
       (case strategy
         :analytical
         (doseq [k analytical-expr-keys]
-          (println (str "    " (name k) ":" (get ind k))))
+          (println (str "    " (name k) ":" (pr-str (normalize-expr (get ind k))))))
         :differential
         (doseq [k differential-expr-keys]
-          (println (str "    " (name k) ":" (get ind k))))
+          (println (str "    " (name k) ":" (pr-str (normalize-expr (get ind k))))))
         (println "    (unknown strategy)")))
     (println "\nBest scenario MSE:")
     (doseq [scenario scenarios]
-      (let [data (scenario-data scenario)
-            metrics (evaluate-predictions best data)]
+      (let [dataset (scenario-data scenario)
+            metrics (evaluate-predictions best dataset)]
         (println (str "  " (name (:id scenario)) " " (name (:strategy metrics))
                       " mse=" (format "%.6f" (:mse metrics))))))))
