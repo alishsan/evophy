@@ -92,6 +92,23 @@
   (let [ds (scenario-data {:m 2.0 :alpha 1.0 :q0x 2.2 :q0y 1.0 :p0x 0.1 :p0y 0.25 :dt 0.04 :steps 40})]
     (is (pos? (calculate-fitness true-grav-rates ds)))))
 
+(deftest simplifier-eliminates-dead-algebra
+  (is (= 0 (#'evophy.core/simplify-expr '(* (- qx qx) alpha))))
+  (is (= 'qx (#'evophy.core/simplify-expr '(+ qx 0))))
+  (is (= 'px (#'evophy.core/simplify-expr '(* 1 px)))))
+
+(deftest behavior-key-collapses-equivalent-expressions
+  (let [probes (build-behavior-probes (scenarios->datasets (take 2 default-scenarios)))
+        variant (assoc true-grav-rates :dpx-expr (list '+ (list '* -1.0 (list '* 'alpha (list 'e/div 'qx r-cubed))) (list '- 'qx 'qx)))]
+    (is (= (individual-behavior-key true-grav-rates probes)
+           (individual-behavior-key variant probes)))))
+
+(deftest distinct-by-behavior-keeps-fewer-when-synonyms-would-dup-genome
+  (let [probes (build-behavior-probes (scenarios->datasets (take 2 default-scenarios)))
+        variant (assoc true-grav-rates :dpx-expr (list '+ (list '* -1.0 (list '* 'alpha (list 'e/div 'qx r-cubed))) (list '- 'qx 'qx)))
+        ranked [(assoc variant :fitness 99.0) (assoc true-grav-rates :fitness 100.0)]]
+    (is (= 1 (count (take-distinct-by-behavior 5 ranked probes))))))
+
 (deftest mutate-produces-printable-expressions
   (let [tree '(+ (e/square qx) (* py m))
         mutated (mutate tree differential-vars)]

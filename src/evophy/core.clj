@@ -9,6 +9,58 @@
 (defn- rewrite-div-in-expr [expr]
   (walk/postwalk #(if (= % 'e/div) 'e// %) expr))
 
+(defn- simplify-expr
+  "Small algebraic simplifier to remove dead GP code before compile/score."
+  [expr]
+  (letfn [(simp [x]
+            (if (and (sequential? x) (seq x))
+              (let [[op & args] (map simp x)]
+                (case op
+                  +
+                  (let [[a b] args]
+                    (cond
+                      (= a 0) b
+                      (= b 0) a
+                      (and (number? a) (number? b)) (+ a b)
+                      :else (list '+ a b)))
+                  -
+                  (let [[a b] args]
+                    (cond
+                      (= a b) 0
+                      (= b 0) a
+                      (and (number? a) (number? b)) (- a b)
+                      :else (list '- a b)))
+                  *
+                  (let [[a b] args]
+                    (cond
+                      (or (= a 0) (= b 0)) 0
+                      (= a 1) b
+                      (= b 1) a
+                      (and (number? a) (number? b)) (* a b)
+                      :else (list '* a b)))
+                  e/square
+                  (let [[a] args]
+                    (if (number? a) (* a a) (list 'e/square a)))
+                  e/sin
+                  (let [[a] args]
+                    (if (number? a) (Math/sin (double a)) (list 'e/sin a)))
+                  e/cos
+                  (let [[a] args]
+                    (if (number? a) (Math/cos (double a)) (list 'e/cos a)))
+                  e/sqrt
+                  (let [[a] args]
+                    (if (and (number? a) (not (neg? a)))
+                      (Math/sqrt (double a))
+                      (list 'e/sqrt a)))
+                  e/div
+                  (let [[a b] args]
+                    (if (and (number? a) (number? b) (not (zero? b)))
+                      (/ a b)
+                      (list 'e/div a b)))
+                  (cons op args)))
+              x))]
+    (simp expr)))
+
 (defn grav2d-energy
   "H = (px² + py²)/(2m) − α/r,  r = √(qx² + qy²)."
   [m alpha {:keys [qx qy px py]}]
@@ -81,12 +133,12 @@
 (defn- compile-state-fn [expr]
   (binding [*ns* (the-ns 'evophy.core)]
     (eval `(fn [~'t ~'q0x ~'q0y ~'p0x ~'p0y ~'m ~'alpha]
-             ~(rewrite-div-in-expr expr)))))
+             ~(-> expr simplify-expr rewrite-div-in-expr)))))
 
 (defn- compile-rate-fn [expr]
   (binding [*ns* (the-ns 'evophy.core)]
     (eval `(fn [~'qx ~'qy ~'px ~'py ~'m ~'alpha]
-             ~(rewrite-div-in-expr expr)))))
+             ~(-> expr simplify-expr rewrite-div-in-expr)))))
 
 (defn- state-at-t [data t]
   (some (fn [s]
@@ -107,7 +159,7 @@
         ad (double alpha)
         {qx-fn :qx qy-fn :qy px-fn :px py-fn :py} fns]
     (reduce
-     (fn [{:keys [sq-q sq-p n] :as acc} t]
+     (fn [acc t]
        (if-let [{:keys [qx qy px py]} (state-at-t data t)]
          (let [td (double t)
                pred-qx (double (qx-fn td q0x q0y p0x p0y md ad))
@@ -141,7 +193,7 @@
 
 (defn- one-step-errors-differential [rate-fns {:keys [data m alpha]}]
   (reduce
-   (fn [{:keys [sq-q sq-p n] :as acc} [s0 s1]]
+   (fn [acc [s0 s1]]
      (let [dt (- (double (:t s1)) (double (:t s0)))
            pred (predict-step-rates rate-fns s0 dt m alpha)]
        (-> acc
@@ -152,6 +204,28 @@
            (update :n inc))))
    {:sq-q 0.0 :sq-p 0.0 :n 0}
    (partition 2 1 data)))
+
+(defn- rollout-errors-differential [rate-fns {:keys [data m alpha]}]
+  (if (<= (count data) 1)
+    {:sq-q 0.0 :sq-p 0.0 :n 0}
+    (let [s0 (first data)]
+      (loop [pred {:qx (:qx s0) :qy (:qy s0) :px (:px s0) :py (:py s0)}
+             prev s0
+             remaining (rest data)
+             acc {:sq-q 0.0 :sq-p 0.0 :n 0}]
+        (if-let [actual (first remaining)]
+          (let [dt (- (double (:t actual)) (double (:t prev)))
+                pred-next (predict-step-rates rate-fns pred dt m alpha)]
+            (recur pred-next
+                   actual
+                   (rest remaining)
+                   (-> acc
+                       (update :sq-q + (+ (e/square (- (:qx pred-next) (:qx actual)))
+                                          (e/square (- (:qy pred-next) (:qy actual)))))
+                       (update :sq-p + (+ (e/square (- (:px pred-next) (:px actual)))
+                                          (e/square (- (:py pred-next) (:py actual)))))
+                       (update :n inc))))
+          acc)))))
 
 (defn expr-uses-symbol? [expr sym]
   (cond
@@ -215,13 +289,95 @@
     :differential (into [:differential] (mapv ind differential-expr-keys))
     [(:strategy ind)]))
 
-(defn- take-distinct-by-genome
-  [n ranked]
+(defn- quant-double ^double [^double x]
+  (double (/ (Math/round (* x 100000.0)) 100000.0)))
+
+(defn- sample-trajectory-indices
+  "Sparse indices along a trajectory for probe reuse (cheap, fixed across runs for same step counts)."
+  [n]
+  (if (zero? n)
+    []
+    (vec (distinct (filter #(< % n)
+                            (if (= n 1)
+                              [0]
+                              [0 1 (quot n 2) (dec n)]))))))
+
+(defn- differential-probes-from-dataset [dataset]
+  (let [{:keys [data m alpha]} dataset
+        n (count data)]
+    (for [i (sample-trajectory-indices n)
+          :let [s (nth data i)]]
+      {:qx (double (:qx s))
+       :qy (double (:qy s))
+       :px (double (:px s))
+       :py (double (:py s))
+       :m (double m)
+       :alpha (double alpha)})))
+
+(defn- analytical-probes-from-dataset [dataset]
+  (let [{:keys [data m alpha]} dataset
+        {:keys [q0x q0y p0x p0y]} (initial-ics data)
+        n (count data)]
+    (for [i (sample-trajectory-indices n)
+          :let [s (nth data i)]]
+      {:t (double (:t s))
+       :q0x (double q0x)
+       :q0y (double q0y)
+       :p0x (double p0x)
+       :p0y (double p0y)
+       :m (double m)
+       :alpha (double alpha)})))
+
+(defn build-behavior-probes
+  "Probe tuples sampled from integrated scenarios — used to hash individuals by outputs, not syntax."
+  [datasets]
+  {:differential (vec (distinct (mapcat differential-probes-from-dataset datasets)))
+   :analytical (vec (distinct (mapcat analytical-probes-from-dataset datasets)))})
+
+(defn individual-behavior-key
+  "Stable key from rounded model outputs on [[build-behavior-probes]]; nil if invalid or eval fails — use genome key then."
+  [ind {:keys [differential analytical]}]
+  (try
+    (when (genome-valid? ind)
+      (case (:strategy ind)
+        :differential
+        (when (seq differential)
+          (let [dqx (compile-rate-fn (:dqx-expr ind))
+                dqy (compile-rate-fn (:dqy-expr ind))
+                dpx (compile-rate-fn (:dpx-expr ind))
+                dpy (compile-rate-fn (:dpy-expr ind))]
+            [:differential
+             (vec
+              (for [{:keys [qx qy px py m alpha]} differential]
+                [(quant-double (double (dqx qx qy px py m alpha)))
+                 (quant-double (double (dqy qx qy px py m alpha)))
+                 (quant-double (double (dpx qx qy px py m alpha)))
+                 (quant-double (double (dpy qx qy px py m alpha)))]))]))
+        :analytical
+        (when (seq analytical)
+          (let [qx-fn (compile-state-fn (:qx-expr ind))
+                qy-fn (compile-state-fn (:qy-expr ind))
+                px-fn (compile-state-fn (:px-expr ind))
+                py-fn (compile-state-fn (:py-expr ind))]
+            [:analytical
+             (vec
+              (for [{:keys [t q0x q0y p0x p0y m alpha]} analytical]
+                [(quant-double (double (qx-fn t q0x q0y p0x p0y m alpha)))
+                 (quant-double (double (qy-fn t q0x q0y p0x p0y m alpha)))
+                 (quant-double (double (px-fn t q0x q0y p0x p0y m alpha)))
+                 (quant-double (double (py-fn t q0x q0y p0x p0y m alpha)))]))]))
+        nil))
+    (catch Exception _ nil)))
+
+(defn take-distinct-by-behavior
+  "Keep top n ranked individuals with unique [[individual-behavior-key]] (fallback: genome key)."
+  [n ranked probes]
   (loop [seen #{} out [] xs (seq ranked)]
     (if (or (= (count out) n) (nil? xs))
       out
       (let [ind (first xs)
-            k (individual-genome-key ind)]
+            k (or (individual-behavior-key ind probes)
+                  (individual-genome-key ind))]
         (if (contains? seen k)
           (recur seen out (rest xs))
           (recur (conj seen k) (conj out ind) (rest xs)))))))
@@ -351,12 +507,16 @@
 (defn- fitness-from-errors
   [{:keys [sq-q sq-p n]} & {:keys [t-factor]}]
   (if (zero? n)
-    0
+    0.0
     (let [n (double n)
-          rmse (Math/sqrt (/ (+ sq-q sq-p) n))
-          ;; 1/(rmse+ε) blows up when rmse≈0; use a floor so fitness stays interpretable.
-          quality (/ 1.0 (+ rmse fitness-rmse-floor))]
-      (* quality (or t-factor 1.0)))))
+          sum-sq (+ sq-q sq-p)]
+      (if (Double/isNaN sum-sq)
+        0.0
+        (let [rmse (Math/sqrt (/ sum-sq n))]
+          (if (Double/isNaN rmse)
+            0.0
+            (let [quality (/ 1.0 (+ rmse fitness-rmse-floor))]
+              (* quality (or t-factor 1.0)))))))))
 
 (defn calculate-analytical-fitness [ind dataset]
   (try
@@ -377,7 +537,11 @@
                  :dqy (compile-rate-fn (:dqy-expr ind))
                  :dpx (compile-rate-fn (:dpx-expr ind))
                  :dpy (compile-rate-fn (:dpy-expr ind))}
-            errors (one-step-errors-differential fns dataset)]
+            one-step (one-step-errors-differential fns dataset)
+            rollout (rollout-errors-differential fns dataset)
+            errors {:sq-q (+ (:sq-q one-step) (:sq-q rollout))
+                    :sq-p (+ (:sq-p one-step) (:sq-p rollout))
+                    :n (+ (:n one-step) (:n rollout))}]
         (fitness-from-errors errors)))
     (catch Exception _ 0)))
 
@@ -534,7 +698,7 @@
     (->> population
          (map (fn [ind]
                 (assoc ind :fitness (calculate-fitness-scenarios ind datasets))))
-         (sort-by :fitness >)
+         (sort-by :fitness #(compare %2 %1))
          (take elite-n)
          (mapcat (fn [parent]
                    (cons parent
@@ -562,10 +726,11 @@
         ranked (->> final-pop
                     (map (fn [ind]
                            (assoc ind :fitness (calculate-fitness-scenarios ind datasets))))
-                    (sort-by :fitness >)
+                    (sort-by :fitness #(compare %2 %1))
                     vec)
+        behavior-probes (build-behavior-probes datasets)
         best (first ranked)
-        top5 (take-distinct-by-genome 5 ranked)]
+        top5 (take-distinct-by-behavior 5 ranked behavior-probes)]
     (save-population! path final-pop
                       :generations-run total-generations
                       :population-size population-size)

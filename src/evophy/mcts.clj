@@ -145,7 +145,7 @@
                 [action child-atom
                  (ucb1 (:visits @child-atom) (:value-sum @child-atom)
                        (:visits @parent-atom) c)]))
-         (sort-by #(nth % 2) >)
+         (sort-by #(nth % 2) #(compare %2 %1))
          first)))
 
 (defn- backprop! [node-atom score]
