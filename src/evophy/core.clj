@@ -421,6 +421,171 @@
     :differential (evaluate-differential-predictions individual dataset)
     {:mse Double/POSITIVE_INFINITY}))
 
+(defn- normalize-expr
+  "GP trees must be plain lists for eval/print; mutate used to leave LazySeq subtrees."
+  [expr]
+  (cond
+    (instance? clojure.lang.LazySeq expr) (normalize-expr (doall expr))
+    (and (sequential? expr) (not (map? expr)))
+    (apply list (map normalize-expr expr))
+    :else expr))
+
+(def ^:private latex-symbol-names
+  '{t "t" m "m" alpha "\\alpha"
+    q0x "q_{0x}" q0y "q_{0y}" p0x "p_{0x}" p0y "p_{0y}"
+    qx "q_x" qy "q_y" px "p_x" py "p_y"})
+
+(def ^:private analytical-equation-specs
+  [[:qx-expr :qx "q_x(t)" "q_x(t)"]
+   [:qy-expr :qy "q_y(t)" "q_y(t)"]
+   [:px-expr :px "p_x(t)" "p_x(t)"]
+   [:py-expr :py "p_y(t)" "p_y(t)"]])
+
+(def ^:private differential-equation-specs
+  [[:dqx-expr :dqx "dq_x/dt" "\\dot{q}_x"]
+   [:dqy-expr :dqy "dq_y/dt" "\\dot{q}_y"]
+   [:dpx-expr :dpx "dp_x/dt" "\\dot{p}_x"]
+   [:dpy-expr :dpy "dp_y/dt" "\\dot{p}_y"]])
+
+(defn- resolve-scenario
+  "scenario — nil (first default), keyword :id, or full scenario map."
+  [scenario]
+  (cond
+    (nil? scenario) (first default-scenarios)
+    (keyword? scenario)
+    (or (first (filter #(= (:id %) scenario) default-scenarios))
+        (throw (ex-info "Unknown scenario id" {:scenario-id scenario
+                                               :known (mapv :id default-scenarios)})))
+    (and (map? scenario) (contains? scenario :q0x)) scenario
+    :else (throw (ex-info "Expected scenario keyword or map with IC keys"
+                          {:scenario scenario}))))
+
+(defn- expr->math
+  [expr & {:keys [latex?]}]
+  (let [child #(expr->math % :latex? latex?)]
+    (cond
+      (number? expr) (str expr)
+      (symbol? expr)
+      (if latex?
+        (get latex-symbol-names expr (name expr))
+        (name expr))
+      (sequential? expr)
+      (let [[op & args] (normalize-expr expr)]
+        (case op
+          + (let [a (child (first args)) b (child (second args))]
+              (if latex? (str a " + " b) (str "(" a " + " b ")")))
+          - (let [a (child (first args)) b (child (second args))]
+              (if latex? (str a " - " b) (str "(" a " - " b ")")))
+          * (let [a (child (first args)) b (child (second args))]
+              (if latex? (str a " \\cdot " b) (str "(" a " * " b ")")))
+          e/square (let [a (child (first args))]
+                     (if latex? (str a "^{2}") (str "square(" a ")")))
+          e/sqrt (let [a (child (first args))]
+                   (if latex? (str "\\sqrt{" a "}") (str "sqrt(" a ")")))
+          e/sin (let [a (child (first args))]
+                  (if latex? (str "\\sin\\left(" a "\\right)") (str "sin(" a ")")))
+          e/cos (let [a (child (first args))]
+                  (if latex? (str "\\cos\\left(" a "\\right)") (str "cos(" a ")")))
+          e/div (let [a (child (first args)) b (child (second args))]
+                  (if latex? (str "\\frac{" a "}{" b "}") (str "(" a " / " b ")")))
+          (if latex?
+            (str "\\mathrm{" (name op) "}\\left("
+                 (clojure.string/join ", " (map child args)) "\\right)")
+            (str "(" (name op) " " (clojure.string/join " " (map child args)) ")"))))
+      :else (str expr))))
+
+(defn- build-equation-map
+  [individual specs format]
+  (into {}
+        (for [[expr-key var-key plain-lhs latex-lhs] specs
+              :let [expr (normalize-expr (get individual expr-key))
+                    lhs (if (= format :latex) latex-lhs plain-lhs)]]
+          [var-key (str lhs " = " (expr->math expr :latex? (= format :latex)))])))
+
+(defn- sample-analytical-at-t [individual dataset t]
+  (let [{:keys [data m alpha]} dataset
+        {:keys [q0x q0y p0x p0y]} (initial-ics data)
+        md (double m)
+        ad (double alpha)
+        td (double t)
+        fns {:qx (compile-state-fn (:qx-expr individual))
+             :qy (compile-state-fn (:qy-expr individual))
+             :px (compile-state-fn (:px-expr individual))
+             :py (compile-state-fn (:py-expr individual))}
+        predicted (into {}
+                        (map (fn [[k f]]
+                               [k (double (f td q0x q0y p0x p0y md ad))])
+                             fns))
+        actual (when-let [s (state-at-t data t)]
+                 (select-keys s [:qx :qy :px :py]))]
+    {:t td
+     :ics {:q0x q0x :q0y q0y :p0x p0x :p0y p0y :m md :alpha ad}
+     :predicted predicted
+     :actual actual}))
+
+(defn- sample-differential-at-index [individual dataset idx]
+  (let [{:keys [data m alpha]} dataset
+        n (count data)
+        i (long (max 0 (min (dec n) (or idx (quot n 2)))))
+        s0 (nth data i)
+        s1 (when (< i (dec n)) (nth data (inc i)))
+        md (double m)
+        ad (double alpha)
+        fns {:dqx (compile-rate-fn (:dqx-expr individual))
+             :dqy (compile-rate-fn (:dqy-expr individual))
+             :dpx (compile-rate-fn (:dpx-expr individual))
+             :dpy (compile-rate-fn (:dpy-expr individual))}
+        rates (into {}
+                    (map (fn [[k f]]
+                           [k (double (f (:qx s0) (:qy s0) (:px s0) (:py s0) md ad))])
+                         fns))
+        dt (when s1 (- (double (:t s1)) (double (:t s0))))
+        predicted-next (when dt (predict-step-rates fns s0 dt m alpha))]
+    {:index i
+     :t (:t s0)
+     :state (select-keys s0 [:qx :qy :px :py])
+     :rates rates
+     :dt dt
+     :predicted-next (select-keys predicted-next [:qx :qy :px :py])
+     :actual-next (when s1 (select-keys s1 [:qx :qy :px :py]))}))
+
+(defn individual->equations
+  "Readable equations for a genome plus optional numeric spot-check.
+
+  individual — map with :strategy and expression keys.
+  scenario — nil, scenario :id keyword, or full scenario map (see resolve-scenario).
+  opts:
+    :format — :plain (default) or :latex
+    :sample-t — analytical only: evaluate all four laws at this t
+    :sample-index — differential only: trajectory index for state/rates (default: midpoint)
+
+  Returns {:strategy :format :scenario-id :scenario-params :equations :metrics :sample}."
+  [individual & {:keys [scenario format sample-t sample-index]
+                 :or {format :plain}}]
+  (let [sc (resolve-scenario scenario)
+        dataset (scenario-data sc)
+        specs (case (:strategy individual)
+                :analytical analytical-equation-specs
+                :differential differential-equation-specs
+                nil)
+        _ (when (nil? specs)
+            (throw (ex-info "Unknown individual strategy" {:strategy (:strategy individual)})))
+        equations (build-equation-map individual specs format)
+        metrics (evaluate-predictions individual dataset)
+        sample (case (:strategy individual)
+                 :analytical
+                 (when sample-t
+                   (sample-analytical-at-t individual dataset sample-t))
+                 :differential
+                 (sample-differential-at-index individual dataset sample-index))]
+    {:strategy (:strategy individual)
+     :format format
+     :scenario-id (:id sc)
+     :scenario-params (select-keys sc [:m :alpha :q0x :q0y :p0x :p0y :dt :steps])
+     :equations equations
+     :metrics metrics
+     :sample sample}))
+
 (def ops '[+ - * e/square e/sin e/cos e/div e/sqrt])
 (def analytical-vars (vec (concat '[t] ic-vars param-vars)))
 (def differential-vars (vec (concat state-vars param-vars)))
@@ -561,15 +726,6 @@
     (if (empty? fits)
       0
       (apply min fits))))
-
-(defn- normalize-expr
-  "GP trees must be plain lists for eval/print; mutate used to leave LazySeq subtrees."
-  [expr]
-  (cond
-    (instance? clojure.lang.LazySeq expr) (normalize-expr (doall expr))
-    (and (sequential? expr) (not (map? expr)))
-    (apply list (map normalize-expr expr))
-    :else expr))
 
 (defn mutate
   ([expr] (mutate expr analytical-vars))

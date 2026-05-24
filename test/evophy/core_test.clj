@@ -115,6 +115,30 @@
     (is (list? mutated))
     (is (not (instance? clojure.lang.LazySeq mutated)))))
 
+(deftest individual->equations-renders-laws
+  (let [ind (assoc true-grav-rates
+              :dqx-expr 'p0x :dqy-expr 'p0y
+              :dpx-expr '(* -1.0 q0x) :dpy-expr '(* -1.0 q0y))
+        plain (individual->equations ind :scenario-id :x-orbit)
+        latex (individual->equations ind :scenario-id :x-orbit :format :latex)]
+    (is (= :differential (:strategy plain)))
+    (is (clojure.string/includes? (:dqx (:equations plain)) "dq_x/dt"))
+    (is (clojure.string/includes? (:dqx (:equations latex)) "\\dot{q}_x"))
+    (is (map? (:metrics plain)))
+    (is (contains? (:sample plain) :rates))))
+
+(deftest individual->equations-analytical-sample
+  (let [ind {:strategy :analytical
+             :qx-expr '(+ q0x (* p0x t))
+             :qy-expr '(+ q0y (* p0y t))
+             :px-expr 'p0x
+             :py-expr 'p0y}
+        eq (individual->equations ind :scenario-id :x-orbit
+                                  :sample-t 0.05)]
+    (is (clojure.string/includes? (:qx (:equations eq)) "q_x(t)"))
+    (is (= 0.05 (:t (:sample eq))))
+    (is (number? (get-in eq [:sample :predicted :qx])))))
+
 (deftest population-persistence-roundtrip
   (let [path (str (io/file (System/getProperty "java.io.tmpdir")
                            (str "evophy-pop-" (System/nanoTime) ".edn")))
