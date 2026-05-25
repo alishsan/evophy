@@ -126,6 +126,98 @@
   [scenarios]
   (mapv scenario-data scenarios))
 
+(def default-scenario-bounds
+  "Box in (m, α, q₀, p₀) for random scenario sampling; |q₀| ≥ :r-min."
+  {:m [0.75 2.5]
+   :alpha [0.75 2.5]
+   :q0x [-2.5 2.5]
+   :q0y [-2.5 2.5]
+   :p0x [-0.45 0.45]
+   :p0y [-0.45 0.45]
+   :dt [0.04 0.05]
+   :steps [60 100]
+   :r-min 1.0})
+
+(defn- uniform-sample
+  "Uniform double in [lo, hi]; uses rng when non-nil, else clojure.core/rand."
+  [rng lo hi]
+  (if rng
+    (+ lo (* (- hi lo) (.nextDouble ^java.util.Random rng)))
+    (+ lo (* (- hi lo) (rand)))))
+
+(defn- uniform-int-sample
+  [rng lo hi]
+  (+ lo (if rng
+          (.nextInt ^java.util.Random rng (inc (- hi lo)))
+          (rand-int (inc (- hi lo))))))
+
+(defn random-scenario
+  "Sample one scenario map inside [[default-scenario-bounds]] (|q₀| ≥ r-min)."
+  [& {:keys [bounds rng id]}]
+  (let [bounds (or bounds default-scenario-bounds)
+        {:keys [m alpha q0x q0y p0x p0y dt steps r-min]} bounds
+        r-min (or r-min 1.0)]
+    (loop [attempt 0]
+      (let [q0x (uniform-sample rng (first q0x) (second q0x))
+            q0y (uniform-sample rng (first q0y) (second q0y))
+            r (Math/sqrt (+ (* q0x q0x) (* q0y q0y)))]
+        (if (>= r r-min)
+          {:id (or id (keyword (str "rand-" (System/nanoTime))))
+           :m (uniform-sample rng (first m) (second m))
+           :alpha (uniform-sample rng (first alpha) (second alpha))
+           :q0x q0x
+           :q0y q0y
+           :p0x (uniform-sample rng (first p0x) (second p0x))
+           :p0y (uniform-sample rng (first p0y) (second p0y))
+           :dt (uniform-sample rng (first dt) (second dt))
+           :steps (uniform-int-sample rng (first steps) (second steps))}
+          (if (> attempt 200)
+            (throw (ex-info "Could not sample valid |q0| >= r-min" {:bounds bounds :r-min r-min}))
+            (recur (inc attempt))))))))
+
+(defn sample-random-scenarios
+  "Sample n scenarios; optional :seed for reproducible draws."
+  [n & {:keys [bounds seed]}]
+  (let [rng (when (some? seed) (java.util.Random. (long seed)))]
+    (mapv (fn [i] (random-scenario :bounds bounds :rng rng :id (keyword (str "rand-" i))))
+          (range n))))
+
+(defn make-fitness-context
+  "Build a fitness evaluation context.
+
+  :mode — :random (default) or :fixed (uses [[default-scenarios]]).
+  :sample-count — random scenarios per evaluation batch (default 32).
+  :aggregate — :min (worst scenario) or :percentile.
+  :percentile — fraction in [0,1] or whole percent e.g. 10 for 10th percentile (default 0.1).
+  :seed — optional; with :generation offset, stabilizes per-generation batches across a run."
+  [& {:keys [mode sample-count aggregate percentile seed]
+      :or {mode :random
+           sample-count 32
+           aggregate :min
+           percentile 0.1}}]
+  (let [pct (if (<= percentile 1) (double percentile) (/ (double percentile) 100.0))]
+    {:mode (keyword mode)
+     :sample-count (long sample-count)
+     :aggregate (keyword aggregate)
+     :percentile pct
+     :seed (when seed (long seed))
+     :datasets (when (= :fixed (keyword mode))
+                 (scenarios->datasets default-scenarios))}))
+
+(defn datasets-for-fitness-context
+  "Materialize scenario datasets for one evaluation (one GP generation when :generation is set)."
+  [ctx & {:keys [generation]}]
+  (case (:mode ctx)
+    :fixed (:datasets ctx)
+    :random
+    (let [n (:sample-count ctx 32)
+          seed (when (:seed ctx) (+ (long (:seed ctx)) (long (or generation 0))))
+          scenarios (apply sample-random-scenarios n
+                           (cond-> {:bounds default-scenario-bounds}
+                             seed (assoc :seed seed)))]
+      (scenarios->datasets scenarios))
+    (throw (ex-info "Unknown fitness context mode" {:mode (:mode ctx)}))))
+
 (def ^:private ic-vars '[q0x q0y p0x p0y])
 (def ^:private state-vars '[qx qy px py])
 (def ^:private param-vars '[m alpha])
@@ -421,7 +513,7 @@
     :differential (evaluate-differential-predictions individual dataset)
     {:mse Double/POSITIVE_INFINITY}))
 
-(defn- normalize-expr
+(defn normalize-expr
   "GP trees must be plain lists for eval/print; mutate used to leave LazySeq subtrees."
   [expr]
   (cond
@@ -719,13 +811,137 @@
         nil)
       0))
 
+(defn aggregate-scenario-fitness
+  "Combine per-scenario fitness values: :min (default) or :percentile."
+  [fits & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
+  (if (empty? fits)
+    0.0
+    (let [sorted (sort fits)]
+      (case (keyword aggregate)
+        :min (double (first sorted))
+        :percentile
+        (let [n (count sorted)
+              idx (min (dec n) (max 0 (int (Math/floor (* (double percentile) (dec n))))))]
+          (double (nth sorted idx)))
+        (throw (ex-info "Unknown fitness aggregate" {:aggregate aggregate}))))))
+
 (defn calculate-fitness-scenarios
-  "Minimum per-scenario fitness—a law must fit every trajectory, not just on average."
-  [individual datasets]
-  (let [fits (mapv #(calculate-fitness individual %) datasets)]
-    (if (empty? fits)
-      0
-      (apply min fits))))
+  "Robust fitness over scenario datasets: :min (worst case) or :percentile (e.g. p10).
+
+  Optional :aggregate and :percentile (see [[aggregate-scenario-fitness]])."
+  [individual datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
+  (aggregate-scenario-fitness
+   (mapv #(calculate-fitness individual %) datasets)
+   :aggregate aggregate
+   :percentile percentile))
+
+(defn- expr-subtrees [expr]
+  (let [expr (normalize-expr expr)]
+    (if (sequential? expr)
+      (cons expr (mapcat expr-subtrees (rest expr)))
+      [expr])))
+
+(defn- slotted-subtrees [ind]
+  (let [keys (case (:strategy ind)
+               :analytical analytical-expr-keys
+               :differential differential-expr-keys)]
+    (for [slot keys, st (expr-subtrees (get ind slot))]
+      {:slot slot :motif st})))
+
+(def ^:private known-physics-motifs
+  "Canonical 2D gravity subtrees → short gloss (exact structural match after normalize-expr)."
+  {'(e/div px m) "Hamilton: q̇_x = p_x/m"
+   '(e/div py m) "Hamilton: q̇_y = p_y/m"
+   '(e/div p0x m) "IC form: q̇_x ≈ p_{0x}/m at t₀"
+   '(e/div p0y m) "IC form: q̇_y ≈ p_{0y}/m at t₀"})
+
+(defn- motif-tags [motif]
+  (cond-> #{}
+    (expr-uses-symbol? motif 'm) (conj :uses-m)
+    (expr-uses-symbol? motif 'alpha) (conj :uses-alpha)
+    (expr-uses-symbol? motif 't) (conj :uses-t)
+    (some #(expr-uses-symbol? motif %) ic-vars) (conj :uses-ic)
+    (some #(expr-uses-symbol? motif %) state-vars) (conj :uses-state)))
+
+(defn- motif-gloss [motif slot]
+  (or (get known-physics-motifs (normalize-expr motif))
+      (cond
+        (and (#{:dqx-expr :dqy-expr} slot) (seq (motif-tags motif)))
+        (str "rate slot " (name slot) " — "
+             (clojure.string/join ", " (map name (motif-tags motif))))
+        (and (#{:qx-expr :qy-expr :px-expr :py-expr} slot) (expr-uses-symbol? motif 't))
+        "trajectory uses time"
+        :else nil)))
+
+(defn population->motif-report
+  "Mine recurring subtrees (micro-heuristics) from a ranked or unranked population.
+
+  population — vector of individuals (e.g. from [[load-population]]).
+  datasets — scenario maps with :data (defaults to [[scenarios->datasets]] on [[default-scenarios]]).
+  opts:
+    :elite-frac — top fraction by fitness to mine (default 0.5)
+    :min-share   — minimum fraction of elite carrying motif (default 0.2)
+    :top         — max motifs to return (default 15)
+
+  Returns {:n-population :n-elite :elite-min-fitness :motifs [...] :physics-hits [...]}."
+  [population & {:keys [datasets elite-frac min-share top]
+                 :or {elite-frac 0.5 min-share 0.2 top 15}}]
+  (let [datasets (or datasets (scenarios->datasets default-scenarios))
+        ranked (->> population
+                    (map (fn [ind]
+                           (assoc ind :fitness (or (:fitness ind)
+                                                   (calculate-fitness-scenarios ind datasets)))))
+                    (sort-by :fitness >))
+        n-pop (count ranked)
+        n-elite (max 1 (int (Math/ceil (* elite-frac n-pop))))
+        elite (take n-elite ranked)
+        min-fit (if (seq elite) (:fitness (last elite)) 0.0)
+        by-motif (reduce
+                  (fn [acc ind]
+                    (let [fit (:fitness ind)
+                          ;; one hit per individual per [slot motif], not per subtree occurrence
+                          unique (reduce (fn [m {:keys [slot motif]}]
+                                           (let [sig (pr-str (normalize-expr motif))]
+                                             (assoc m [slot sig] (normalize-expr motif))))
+                                         {}
+                                         (slotted-subtrees ind))]
+                      (reduce
+                       (fn [a [[slot sig] motif]]
+                         (update a [slot sig]
+                                   (fn [v]
+                                     (let [base (or v {:slot slot
+                                                       :signature sig
+                                                       :motif motif
+                                                       :count 0
+                                                       :fitness-sum 0.0})]
+                                       (-> base
+                                           (update :count inc)
+                                           (update :fitness-sum + fit))))))
+                       acc
+                       unique)))
+                  {}
+                  elite)
+        enriched (for [[_ v] by-motif
+                       :let [cnt (:count v)
+                             share (/ (double cnt) n-elite)
+                             avg (/ (:fitness-sum v) (double cnt))]
+                       :when (>= share min-share)]
+                   (let [motif (:motif v)]
+                     (assoc v
+                            :share share
+                            :avg-fitness avg
+                            :tags (motif-tags motif)
+                            :gloss (motif-gloss motif (:slot v)))))
+        sorted (take top (sort-by (juxt :share :avg-fitness) #(compare %2 %1) enriched))
+        physics-hits (vec (keep #(when (get known-physics-motifs (:motif %))
+                                  (assoc (select-keys % [:slot :motif :signature :share])
+                                         :gloss (get known-physics-motifs (:motif %))))
+                            enriched))]
+    {:n-population n-pop
+     :n-elite n-elite
+     :elite-min-fitness min-fit
+     :motifs sorted
+     :physics-hits physics-hits}))
 
 (defn mutate
   ([expr] (mutate expr analytical-vars))
@@ -822,29 +1038,53 @@
                :generations 50
                :population-size 50
                :mcts-simulations default-mcts-simulations
+               :mcts-until-stop false
                :mcts-inject default-mcts-inject
-               :mcts? true}
+               :mcts? true
+               :prompt-each-generation false
+               :fitness-mode :random
+               :scenario-samples 32
+               :fitness-aggregate :min
+               :fitness-percentile 10
+               :scenario-seed nil}
          xs args]
     (if (empty? xs)
-      opts
+      (assoc opts :fitness-context
+             (make-fitness-context :mode (:fitness-mode opts)
+                                   :sample-count (:scenario-samples opts)
+                                   :aggregate (:fitness-aggregate opts)
+                                   :percentile (:fitness-percentile opts)
+                                   :seed (:scenario-seed opts)))
       (let [[a & more] xs]
         (case a
           "--fresh" (recur (assoc opts :fresh? true) more)
           "--no-mcts" (recur (assoc opts :mcts? false) more)
+          "--mcts-until-stop" (recur (assoc opts :mcts-until-stop true) more)
+          "--prompt-each-generation" (recur (assoc opts :prompt-each-generation true) more)
+          "--fixed-scenarios" (recur (assoc opts :fitness-mode :fixed) more)
+          "--random-scenarios" (recur (assoc opts :fitness-mode :random) more)
+          "--scenario-samples" (recur (assoc opts :scenario-samples (Long/parseLong (first more))) (rest more))
+          "--fitness-aggregate" (recur (assoc opts :fitness-aggregate (keyword (first more))) (rest more))
+          "--fitness-percentile" (recur (assoc opts :fitness-percentile (Long/parseLong (first more))) (rest more))
+          "--scenario-seed" (recur (assoc opts :scenario-seed (Long/parseLong (first more))) (rest more))
           "--mcts-simulations" (recur (assoc opts :mcts-simulations (Long/parseLong (first more))) (rest more))
           "--mcts-inject" (recur (assoc opts :mcts-inject (Long/parseLong (first more))) (rest more))
           "--population" (recur (assoc opts :path (first more)) (rest more))
           "--generations" (recur (assoc opts :generations (Long/parseLong (first more))) (rest more))
           "--population-size" (recur (assoc opts :population-size (Long/parseLong (first more))) (rest more))
-          (throw (ex-info "Unknown argument (try --fresh --no-mcts --mcts-simulations N --mcts-inject N --population PATH --generations N --population-size N)"
-                          {:arg a})))))))
+          (throw (ex-info "Unknown argument"
+                          {:arg a
+                           :hint "--fresh --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-mcts ..."})))))))
 
 (defn evolve-generation
-  [population datasets population-size & {:keys [mcts? mcts-simulations mcts-inject]
-                                          :or {mcts? true
-                                               mcts-simulations default-mcts-simulations
-                                               mcts-inject default-mcts-inject}}]
-  (let [injected (when (and mcts? (pos? mcts-inject))
+  [population fitness-ctx population-size generation-index
+   & {:keys [mcts? mcts-simulations mcts-inject]
+      :or {mcts? true
+           mcts-simulations default-mcts-simulations
+           mcts-inject default-mcts-inject}}]
+  (let [datasets (datasets-for-fitness-context fitness-ctx :generation generation-index)
+        fit-opts (select-keys fitness-ctx [:aggregate :percentile])
+        injected (when (and mcts? (pos? mcts-inject))
                    (require 'evophy.mcts)
                    ((ns-resolve 'evophy.mcts 'generation-inject)
                     datasets mcts-simulations mcts-inject))
@@ -853,7 +1093,9 @@
         branch-factor (long (Math/ceil (/ population-size (double elite-n))))]
     (->> population
          (map (fn [ind]
-                (assoc ind :fitness (calculate-fitness-scenarios ind datasets))))
+                (assoc ind :fitness (calculate-fitness-scenarios ind datasets
+                                                               :aggregate (:aggregate fit-opts)
+                                                               :percentile (:percentile fit-opts)))))
          (sort-by :fitness #(compare %2 %1))
          (take elite-n)
          (mapcat (fn [parent]
@@ -863,38 +1105,85 @@
          (take population-size)
          (vec))))
 
+(defn- prompt-continue-evolution? []
+  (print "  Enter = next generation, q = stop and save: ")
+  (flush)
+  (not= "q" (clojure.string/trim (or (read-line) ""))))
+
 (defn -main [& args]
   (timbre/merge-config! {:min-level :warn})
-  (let [{:keys [fresh? path generations population-size mcts? mcts-simulations mcts-inject]}
+  (require 'evophy.mcts)
+  ((ns-resolve 'evophy.mcts 'install-stop-handler!))
+  ((ns-resolve 'evophy.mcts 'clear-stop!))
+  (let [stop-requested? (ns-resolve 'evophy.mcts 'stop-requested?)
+        request-stop! (ns-resolve 'evophy.mcts 'request-stop!)
+        {:keys [fresh? path generations population-size mcts? mcts-simulations mcts-until-stop
+                mcts-inject prompt-each-generation
+                fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile]}
         (parse-args args)
-        scenarios default-scenarios
-        datasets (scenarios->datasets scenarios)
+        max-mcts-sims (if mcts-until-stop Long/MAX_VALUE mcts-simulations)
+        report-scenarios default-scenarios
         {:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
                                      :path path
                                      :population-size population-size})
         initial (normalize-population-size population population-size)
-        evolve-opts {:mcts? mcts? :mcts-simulations mcts-simulations :mcts-inject mcts-inject}
-        final-pop (reduce (fn [pop _] (apply evolve-generation pop datasets population-size evolve-opts))
-                          initial
-                          (range generations))
-        total-generations (+ generations-run generations)
+        evolve-opts {:mcts? mcts? :mcts-simulations max-mcts-sims :mcts-inject mcts-inject}
+        fit-opts (select-keys fitness-context [:aggregate :percentile])
+        checkpoint (atom {:pop initial :generations-run generations-run})
+        save-checkpoint!
+        (fn [pop gens]
+          (reset! checkpoint {:pop pop :generations-run gens})
+          (save-population! path pop
+                            :generations-run gens
+                            :population-size population-size))
+        _ (do (save-checkpoint! initial generations-run)
+              (println "checkpoint:" path
+                       (if resumed? "(resuming)" "(new run — use --fresh to ignore existing file)")))
+        final-pop (reduce
+                   (fn [pop gen-idx]
+                     (if (stop-requested?)
+                       (reduced pop)
+                       (let [pop' (apply evolve-generation pop fitness-context population-size
+                                         gen-idx evolve-opts)
+                             gens (+ generations-run (inc gen-idx))]
+                         (save-checkpoint! pop' gens)
+                         (println "  generation" (inc gen-idx) "/" generations "saved")
+                         (if (and prompt-each-generation
+                                  (< gen-idx (dec generations))
+                                  (not (prompt-continue-evolution?)))
+                           (do (request-stop!) (reduced pop'))
+                           pop'))))
+                   initial
+                   (range generations))
+        total-generations (:generations-run @checkpoint)
+        final-datasets (datasets-for-fitness-context fitness-context :generation generations)
+        final-probes (build-behavior-probes final-datasets)
         ranked (->> final-pop
                     (map (fn [ind]
-                           (assoc ind :fitness (calculate-fitness-scenarios ind datasets))))
+                           (assoc ind :fitness (calculate-fitness-scenarios ind final-datasets
+                                                                          :aggregate (:aggregate fit-opts)
+                                                                          :percentile (:percentile fit-opts)))))
                     (sort-by :fitness #(compare %2 %1))
                     vec)
-        behavior-probes (build-behavior-probes datasets)
         best (first ranked)
-        top5 (take-distinct-by-behavior 5 ranked behavior-probes)]
-    (save-population! path final-pop
-                      :generations-run total-generations
-                      :population-size population-size)
-    (println (if resumed? "resumed from" "started new; saved to") path)
+        top5 (take-distinct-by-behavior 5 ranked final-probes)]
+    (save-checkpoint! final-pop total-generations)
+    (println (if resumed? "resumed from" "finished; checkpoint") path)
     (println "total generations (cumulative):" total-generations)
-    (println "scenarios:" (count scenarios))
+    (println "fitness mode:" (name fitness-mode)
+             "| samples/gen:" scenario-samples
+             "| aggregate:" (name fitness-aggregate)
+             (when (= fitness-aggregate :percentile)
+               (str "| p" fitness-percentile)))
+    (when (= fitness-mode :random)
+      (println "  (new random scenario batch each generation; use --fixed-scenarios for the 5 named orbits)"))
+    (when (stop-requested?)
+      (println "stopped early (Ctrl+C, q at prompt, or request-stop!) — saved best-so-far population"))
     (when mcts?
-      (println "hybrid GP+MCTS:" mcts-inject "injections x" mcts-simulations "simulations/gen"))
+      (println "hybrid GP+MCTS:" mcts-inject "injections x"
+               (if mcts-until-stop "until-stop" (str max-mcts-sims " max sims/injection")))
+      (println "  Ctrl+C stops MCTS/evolution gracefully; best genome kept in checkpoint"))
     (when-not mcts?
       (println "hybrid: MCTS disabled (--no-mcts)"))
     (println "\nTop 5:")
@@ -908,8 +1197,8 @@
         (doseq [k differential-expr-keys]
           (println (str "    " (name k) ":" (pr-str (normalize-expr (get ind k))))))
         (println "    (unknown strategy)")))
-    (println "\nBest scenario MSE:")
-    (doseq [scenario scenarios]
+    (println "\nBest on fixed reference scenarios (MSE):")
+    (doseq [scenario report-scenarios]
       (let [dataset (scenario-data scenario)
             metrics (evaluate-predictions best dataset)]
         (println (str "  " (name (:id scenario)) " " (name (:strategy metrics))

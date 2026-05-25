@@ -1,6 +1,9 @@
 (ns evophy.mcts
-  "MCTS builds analytical genomes; GP selects and mutates each generation."
-  (:require [evophy.core :as core]))
+  "MCTS builds analytical genomes; GP selects and mutates each generation.
+
+  Search can stop early (Ctrl+C or [[request-stop!]]) and return the best genome found so far."
+  (:require [evophy.core :as core])
+  (:import (sun.misc Signal SignalHandler)))
 
 (def ^:private hole '__hole__)
 (def ^:private default-exploration 1.41)
@@ -9,6 +12,37 @@
 (def ^:private analytical-phases [:qx :qy :px :py])
 (def ^:private phase->expr-key
   {:qx :qx-expr :qy :qy-expr :px :px-expr :py :py-expr})
+
+(defonce ^:private stop-flag (atom false))
+(defonce ^:private handler-installed? (atom false))
+(defonce ^:private last-search-stats (atom nil))
+
+(defn stop-requested? []
+  (or @stop-flag (Thread/interrupted)))
+
+(defn request-stop! []
+  (reset! stop-flag true)
+  (println "\n[evophy] Stop requested — finishing current step, then returning best-so-far…"))
+
+(defn clear-stop! []
+  (reset! stop-flag false)
+  (Thread/interrupted) ;; clear interrupt flag if set
+  false)
+
+(defn last-search-result []
+  @last-search-stats)
+
+(defn install-stop-handler!
+  "Register SIGINT (Ctrl+C) to call [[request-stop!]] without killing the JVM immediately."
+  []
+  (when-not @handler-installed?
+    (try
+      (Signal/handle "INT"
+                     (proxy [SignalHandler] []
+                       (handle [_] (request-stop!))))
+      (reset! handler-installed? true)
+      (catch Throwable _
+        nil))))
 
 (defn- hole? [x] (= x hole))
 
@@ -158,8 +192,8 @@
 (defn- note-best! [best-atom ind datasets]
   (when (core/genome-valid? ind)
     (let [fit (fitness-for-individual ind datasets)]
-      (when (and (pos? fit) (> fit (:fitness @best-atom)))
-        (reset! best-atom {:fitness fit :individual ind})))))
+      (when (> fit (:fitness @best-atom))
+        (swap! best-atom assoc :fitness fit :individual ind)))))
 
 (defn- expand! [node datasets _c best-atom]
   (when-let [pair (first (:untried @node))]
@@ -188,9 +222,19 @@
 
       :else node)))
 
+(defn- resolve-individual [best-atom]
+  (or (when-let [i (:individual @best-atom)]
+        (when (core/genome-valid? i) i))
+      (core/random-analytical-individual)))
+
 (defn search-analytical-individual
-  [datasets simulations]
-  (when (pos? simulations)
+  "Run MCTS for up to max-simulations tree traversals (or until [[stop-requested?]]).
+
+  Returns the best analytical genome found. Metadata is stored in [[last-search-result]].
+  Optional :should-stop? fn (default [[stop-requested?]]), :on-progress fn called as {:sim n :best-fitness f}."
+  [datasets max-simulations & {:keys [should-stop? on-progress]
+                               :or {should-stop? stop-requested?}}]
+  (when (pos? max-simulations)
     (reset! fitness-cache {})
     (let [c default-exploration
           root-state (initial-state)
@@ -199,14 +243,33 @@
                       :children {}
                       :untried (vec (or (state-action-pairs root-state) []))
                       :parent nil})
-          best (atom {:fitness -1.0 :individual nil})]
-      (dotimes [_ simulations]
-        (traverse root datasets c best))
-      (let [ind (or (when-let [i (:individual @best)]
-                      (when (core/genome-valid? i) i))
-                    (core/random-analytical-individual))]
-        (if (core/genome-valid? ind) ind (core/random-analytical-individual))))))
+          best (atom {:fitness -1.0 :individual nil})
+          ran (loop [sim 0]
+                (if (or (>= sim max-simulations) (should-stop?))
+                  sim
+                  (do
+                    (traverse root datasets c best)
+                    (when on-progress
+                      (on-progress {:sim (inc sim) :best-fitness (:fitness @best)}))
+                    (recur (inc sim)))))]
+      (let [stopped? (should-stop?)]
+        (when stopped?
+          (println (str "[MCTS] stopped after " ran " simulation"
+                        (when (not= 1 ran) "s")
+                        " (best fitness " (format "%.4f" (:fitness @best)) ")")))
+        (let [ind (resolve-individual best)]
+          (reset! last-search-stats
+                  {:individual ind
+                   :simulations-run ran
+                   :max-simulations max-simulations
+                   :best-fitness (:fitness @best)
+                   :stopped? stopped?})
+          (if (core/genome-valid? ind) ind (core/random-analytical-individual)))))))
 
 (defn generation-inject
-  [datasets simulations n]
-  (vec (repeatedly n #(search-analytical-individual datasets simulations))))
+  "Inject up to n MCTS individuals; stops early if [[stop-requested?]]."
+  [datasets max-simulations n]
+  (loop [i 0 acc []]
+    (if (or (>= i n) (stop-requested?))
+      acc
+      (recur (inc i) (conj acc (search-analytical-individual datasets max-simulations))))))

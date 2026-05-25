@@ -88,6 +88,30 @@
     (testing "each scenario dataset is non-empty"
       (is (every? #(pos? (count (:data %))) datasets)))))
 
+(deftest random-scenario-respects-radius-floor
+  (let [{:keys [q0x q0y]} (first (sample-random-scenarios 1 :seed 42))]
+    (is (>= (Math/sqrt (+ (* q0x q0x) (* q0y q0y))) 1.0))))
+
+(deftest aggregate-percentile-between-min-and-mean
+  (let [fits [0.05 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9]]
+    (is (>= (aggregate-scenario-fitness fits :aggregate :percentile :percentile 0.2)
+            (aggregate-scenario-fitness fits :aggregate :min)))
+    (is (<= (aggregate-scenario-fitness fits :aggregate :percentile :percentile 0.2)
+            (/ (reduce + fits) (count fits))))))
+
+(deftest true-rates-beat-wrong-on-random-scenario-batch
+  (let [ctx (make-fitness-context :mode :random :sample-count 6 :seed 99 :aggregate :min)
+        datasets (datasets-for-fitness-context ctx)]
+    (is (= 6 (count datasets)))
+    (is (> (calculate-fitness-scenarios true-grav-rates datasets)
+           (calculate-fitness-scenarios wrong-grav-rates datasets)))))
+
+(deftest datasets-for-context-new-batch-each-generation
+  (let [ctx (make-fitness-context :mode :random :sample-count 8 :seed 1)
+        a (datasets-for-fitness-context ctx :generation 0)
+        b (datasets-for-fitness-context ctx :generation 1)]
+    (is (not= (map :q0x a) (map :q0x b)))))
+
 (deftest true-rates-fit-heavy-m-scenario
   (let [ds (scenario-data {:m 2.0 :alpha 1.0 :q0x 2.2 :q0y 1.0 :p0x 0.1 :p0y 0.25 :dt 0.04 :steps 40})]
     (is (pos? (calculate-fitness true-grav-rates ds)))))
@@ -126,6 +150,23 @@
     (is (clojure.string/includes? (:dqx (:equations latex)) "\\dot{q}_x"))
     (is (map? (:metrics plain)))
     (is (contains? (:sample plain) :rates))))
+
+(deftest population->motif-report-finds-shared-subtrees
+  (let [pop [{:strategy :analytical
+              :qx-expr '(+ (e/cos t) q0y)
+              :qy-expr '(e/cos (e/square t))
+              :px-expr 'p0x
+              :py-expr 't}
+             {:strategy :analytical
+              :qx-expr '(+ (e/cos t) q0y)
+              :qy-expr '(e/sin t)
+              :px-expr 'p0x
+              :py-expr 't}]
+        report (population->motif-report pop :elite-frac 1.0 :min-share 0.5 :top 10)]
+    (is (= 2 (:n-population report)))
+    (is (pos? (count (:motifs report))))
+    (is (some #(= (:signature %) "(+ (e/cos t) q0y)")
+              (:motifs report)))))
 
 (deftest individual->equations-analytical-sample
   (let [ind {:strategy :analytical
