@@ -11,4 +11,6 @@
                  [clj-python/libpython-clj "2.024"]] ;; To bridge to JAX/PyTorch if needed
   :main evophy.core
   :target-path "target/%s"
+  :aliases {"fitness-progress"  ["run" "-m" "clojure.main" "dev/fitness_progress.clj"]
+            "top-expressions"   ["run" "-m" "clojure.main" "dev/top_expressions.clj"]}
   :profiles {:uberjar {:aot [evophy.core]}})
