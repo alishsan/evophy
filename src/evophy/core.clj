@@ -24,12 +24,15 @@
                       (and (number? a) (number? b)) (+ a b)
                       :else (list '+ a b)))
                   -
-                  (let [[a b] args]
-                    (cond
-                      (= a b) 0
-                      (= b 0) a
-                      (and (number? a) (number? b)) (- a b)
-                      :else (list '- a b)))
+                  (if (= (count args) 1)
+                    (let [[a] args]
+                      (if (number? a) (- a) (list '- a)))
+                    (let [[a b] args]
+                      (cond
+                        (= a b) 0
+                        (= b 0) a
+                        (and (number? a) (number? b)) (- a b)
+                        :else (list '- a b))))
                   *
                   (let [[a b] args]
                     (cond
@@ -54,9 +57,11 @@
                       (list 'e/sqrt a)))
                   e/div
                   (let [[a b] args]
-                    (if (and (number? a) (number? b) (not (zero? b)))
-                      (/ a b)
-                      (list 'e/div a b)))
+                    (cond
+                      (and (number? a) (number? b) (not (zero? b))) (/ a b)
+                      (= a b) 1              ; a/a → 1 (catches qy/qy, px/px, etc.)
+                      (= b 1) a              ; a/1 → a
+                      :else (list 'e/div a b)))
                   (cons op args)))
               x))]
     (simp expr)))
@@ -362,11 +367,37 @@
   (if (instance? Number v) (double v) Double/NaN))
 
 (defn- compile-state-fn [expr]
+  ;; Derived variables from initial conditions:
+  ;;   r0/r02/r03  — initial orbital radius and its powers
+  ;;   omega       — circular angular velocity sqrt(α/(m·r₀³)); exact for circular orbit
+  ;;   omega-L     — true initial angular velocity L/(m·r₀²) = (q×p)/(m·r₀²); works for all orbits
+  ;; Together these let the GP express Taylor corrections, circular rotation, and the
+  ;; angular-momentum rotation approximation q(t) ≈ R(Ω_L·t)·q₀.
   (binding [*ns* (the-ns 'evophy.core)]
     (eval `(fn [~'t ~'q0x ~'q0y ~'p0x ~'p0y ~'m ~'alpha]
-             ~(-> expr simplify-expr rewrite-div-in-expr)))))
+             (let [~'r02    (+ (* ~'q0x ~'q0x) (* ~'q0y ~'q0y))
+                   ~'r0     (Math/sqrt (max ~'r02 1e-24))
+                   ~'r03    (* ~'r0 ~'r02)
+                   ~'r05    (* ~'r03 ~'r02)
+                   ~'r06    (* ~'r03 ~'r03)
+                   ~'omega  (Math/sqrt (max 0.0 (/ ~'alpha (* ~'m ~'r03))))
+                   ;; Angular velocity from the actual angular momentum L = q×p
+                   ~'omega-L (/ (- (* ~'q0x ~'p0y) (* ~'q0y ~'p0x))
+                                (* ~'m ~'r02))]
+               ~(-> expr simplify-expr rewrite-div-in-expr))))))
 
 (defn- compile-rate-fn [expr]
+  (binding [*ns* (the-ns 'evophy.core)]
+    (eval `(fn [~'qx ~'qy ~'px ~'py ~'m ~'alpha]
+             (let [~'r2 (+ (* ~'qx ~'qx) (* ~'qy ~'qy))
+                   ~'r  (Math/sqrt (max ~'r2 1e-24))
+                   ~'r3 (* ~'r ~'r2)]
+               ~(-> expr simplify-expr rewrite-div-in-expr))))))
+
+(defn- compile-conserved-fn
+  "Compile conserved-quantity expression to a fn [qx qy px py m alpha] -> double.
+   Derives r, r2, r3 from position — identical binding to compile-rate-fn."
+  [expr]
   (binding [*ns* (the-ns 'evophy.core)]
     (eval `(fn [~'qx ~'qy ~'px ~'py ~'m ~'alpha]
              (let [~'r2 (+ (* ~'qx ~'qx) (* ~'qy ~'qy))
@@ -382,6 +413,16 @@
 
 (defn- all-horizon-times [data]
   (vec (distinct (map :t (filter #(pos? (double (:t %))) data)))))
+
+(defn- short-horizon-times
+  "Times covering only the first `frac` of the trajectory (default 15%).
+   Analytical expressions can't predict full Keplerian orbits (transcendental),
+   but Taylor expansion approximations work well for short horizons."
+  ([data] (short-horizon-times data 0.15))
+  ([data frac]
+   (let [ts (all-horizon-times data)
+         n  (max 1 (int (Math/ceil (* frac (count ts)))))]
+     (vec (take n ts)))))
 
 (defn- initial-ics [data]
   (let [{:keys [qx qy px py]} (first data)]
@@ -410,26 +451,39 @@
      {:sq-q 0.0 :sq-p 0.0 :n 0}
      horizon-times)))
 
-(defn- predict-step-rates
-  "One Euler step from current (qx,qy,px,py) using evolved rate laws."
+(defn- symplectic-step-rates
+  "Störmer-Verlet (symplectic) step using evolved rate laws.
+   Treats dqx/dqy as velocity equations and dpx/dpy as force equations,
+   mirroring the integrator used to generate reference data.
+   This ensures that even the correct Newtonian ODE accumulates near-zero
+   rollout error, rather than the O(N·dt) drift that plain Euler produces."
   [{:keys [dqx dqy dpx dpy]} {:keys [qx qy px py]} dt m alpha]
-  (let [md (double m)
-        ad (double alpha)
-        dqx (safe-double (dqx qx qy px py md ad))
-        dqy (safe-double (dqy qx qy px py md ad))
-        dpx (safe-double (dpx qx qy px py md ad))
-        dpy (safe-double (dpy qx qy px py md ad))
-        dt (double dt)]
-    {:qx (+ (double qx) (* dqx dt))
-     :qy (+ (double qy) (* dqy dt))
-     :px (+ (double px) (* dpx dt))
-     :py (+ (double py) (* dpy dt))}))
+  (let [md  (double m)
+        ad  (double alpha)
+        dt  (double dt)
+        h   (* 0.5 dt)
+        ;; Half-step momentum update
+        fpx (safe-double (dpx qx qy px py md ad))
+        fpy (safe-double (dpy qx qy px py md ad))
+        px1 (+ (double px) (* fpx h))
+        py1 (+ (double py) (* fpy h))
+        ;; Full-step position update using mid-step velocity
+        vqx (safe-double (dqx qx qy px1 py1 md ad))
+        vqy (safe-double (dqy qx qy px1 py1 md ad))
+        qx2 (+ (double qx) (* vqx dt))
+        qy2 (+ (double qy) (* vqy dt))
+        ;; Second half-step momentum update at new position
+        fpx2 (safe-double (dpx qx2 qy2 px1 py1 md ad))
+        fpy2 (safe-double (dpy qx2 qy2 px1 py1 md ad))]
+    {:qx qx2 :qy qy2
+     :px (+ px1 (* fpx2 h))
+     :py (+ py1 (* fpy2 h))}))
 
 (defn- one-step-errors-differential [rate-fns {:keys [data m alpha]}]
   (reduce
    (fn [acc [s0 s1]]
      (let [dt (- (double (:t s1)) (double (:t s0)))
-           pred (predict-step-rates rate-fns s0 dt m alpha)]
+           pred (symplectic-step-rates rate-fns s0 dt m alpha)]
        (-> acc
            (update :sq-q + (+ (e/square (- (:qx pred) (:qx s1)))
                               (e/square (- (:qy pred) (:qy s1)))))
@@ -440,16 +494,18 @@
    (partition 2 1 data)))
 
 (defn- rollout-errors-differential [rate-fns {:keys [data m alpha]}]
+  ;; Uses symplectic integration for rollout so that the correct Newtonian ODE
+  ;; accumulates near-zero error, not O(N·dt) Euler drift.
   (if (<= (count data) 1)
     {:sq-q 0.0 :sq-p 0.0 :n 0}
     (let [s0 (first data)]
-      (loop [pred {:qx (:qx s0) :qy (:qy s0) :px (:px s0) :py (:py s0)}
-             prev s0
+      (loop [pred      {:qx (:qx s0) :qy (:qy s0) :px (:px s0) :py (:py s0)}
+             prev      s0
              remaining (rest data)
-             acc {:sq-q 0.0 :sq-p 0.0 :n 0}]
+             acc       {:sq-q 0.0 :sq-p 0.0 :n 0}]
         (if-let [actual (first remaining)]
-          (let [dt (- (double (:t actual)) (double (:t prev)))
-                pred-next (predict-step-rates rate-fns pred dt m alpha)]
+          (let [dt         (- (double (:t actual)) (double (:t prev)))
+                pred-next  (symplectic-step-rates rate-fns pred dt m alpha)]
             (recur pred-next
                    actual
                    (rest remaining)
@@ -470,10 +526,15 @@
 (defn expr-uses-t? [expr]
   (expr-uses-symbol? expr 't))
 
-(def analytical-expr-keys [:qx-expr :qy-expr :px-expr :py-expr])
-(def differential-expr-keys [:dqx-expr :dqy-expr :dpx-expr :dpy-expr])
+(def analytical-expr-keys    [:qx-expr :qy-expr :px-expr :py-expr])
+(def differential-expr-keys  [:dqx-expr :dqy-expr :dpx-expr :dpy-expr])
+(def conserved-expr-key      :c-expr)
 
-(def required-analytical-symbols (into ic-vars param-vars))
+;; Analytical expressions must reference the initial position (q0x, q0y) so they aren't
+;; trivially constant.  We don't mandate p0x/p0y or alpha explicitly: the circular solution
+;; is fully determined by position and omega = sqrt(alpha/(m*r03)), so alpha is implicit.
+;; Requiring m ensures the GP uses mass (affects the circular frequency).
+(def required-analytical-symbols   '[q0x q0y m])
 (def ^:private required-differential-symbols (into state-vars param-vars))
 
 (defn- symbols-covered-across-exprs? [expr-keys ind required-syms]
@@ -513,20 +574,32 @@
   (and (every? #(expr-uses-t? (get ind %)) analytical-expr-keys)
        (symbols-covered-across-exprs? analytical-expr-keys ind required-analytical-symbols)))
 
+(defn- conserved-genome-valid?
+  "A conserved-quantity genome must use at least one dynamic state variable
+   (qx, qy, px, py) so trivially-constant expressions (just m, alpha, etc.) are rejected."
+  [ind]
+  (let [expr (get ind conserved-expr-key)]
+    (and (some? expr)
+         (not (number? (simplify-expr expr)))
+         (some #(expr-uses-symbol? expr %) state-vars))))
+
 (defn genome-valid?
   "Analytical: each expr uses t; ICs and (m, α) appear across trajectory laws.
-   Differential: state coords and (m, α) appear across rate laws."
+   Differential: state coords and (m, α) appear across rate laws.
+   Conserved: expression uses at least one dynamic state variable."
   [{:keys [strategy] :as ind}]
   (case strategy
-    :analytical (analytical-genome-valid? ind)
+    :analytical   (analytical-genome-valid? ind)
     :differential (symbols-covered-across-exprs? differential-expr-keys ind
-                                                required-differential-symbols)
+                                                 required-differential-symbols)
+    :conserved    (conserved-genome-valid? ind)
     false))
 
 (defn individual-genome-key [ind]
   (case (:strategy ind)
-    :analytical (into [:analytical] (mapv ind analytical-expr-keys))
+    :analytical   (into [:analytical]   (mapv ind analytical-expr-keys))
     :differential (into [:differential] (mapv ind differential-expr-keys))
+    :conserved    [:conserved (get ind conserved-expr-key)]
     [(:strategy ind)]))
 
 (defn- quant-double ^double [^double x]
@@ -652,13 +725,39 @@
         {:strategy :differential :n-horizons (long n)
          :mse-q (/ sq-q n) :mse-p (/ sq-p n) :mse (/ (+ sq-q sq-p) n)}))))
 
+(defn- evaluate-conserved-predictions
+  "Metrics for a conserved-quantity individual: CoV = std/|mean| along trajectory."
+  [ind dataset]
+  (try
+    (let [c-fn  (compile-conserved-fn (:c-expr ind))
+          {:keys [data m alpha]} dataset
+          md    (double m)
+          ad    (double alpha)
+          vals  (mapv (fn [{:keys [qx qy px py]}]
+                        (safe-double (c-fn (double qx) (double qy)
+                                          (double px) (double py) md ad)))
+                      data)
+          fvals (filterv #(Double/isFinite %) vals)
+          n     (count fvals)]
+      (if (< n 3)
+        {:strategy :conserved :mse Double/POSITIVE_INFINITY :n-horizons 0}
+        (let [mean     (/ (reduce + fvals) n)
+              variance (/ (reduce (fn [s v] (let [d (- v mean)] (+ s (* d d)))) 0.0 fvals) n)]
+          {:strategy :conserved
+           :n-horizons n
+           ;; mse here = squared CoV, for consistency with the display format
+           :mse (if (< (Math/abs mean) 1e-8) Double/POSITIVE_INFINITY
+                    (/ variance (* mean mean)))})))
+    (catch Exception _ {:strategy :conserved :mse Double/POSITIVE_INFINITY :n-horizons 0})))
+
 (defn evaluate-predictions
   "Horizon error for an individual genome vs integrated trajectory (all t > 0).
    dataset is a scenario map with :data, :m, :alpha."
   [individual dataset]
   (case (:strategy individual)
-    :analytical (evaluate-analytical-predictions individual dataset)
+    :analytical   (evaluate-analytical-predictions   individual dataset)
     :differential (evaluate-differential-predictions individual dataset)
+    :conserved    (evaluate-conserved-predictions    individual dataset)
     {:mse Double/POSITIVE_INFINITY}))
 
 (defn normalize-expr
@@ -680,6 +779,9 @@
    [:qy-expr :qy "q_y(t)" "q_y(t)"]
    [:px-expr :px "p_x(t)" "p_x(t)"]
    [:py-expr :py "p_y(t)" "p_y(t)"]])
+
+(def ^:private conserved-equation-specs
+  [[:c-expr :c "C(q,p)" "C(\\mathbf{q},\\mathbf{p})"]])
 
 (def ^:private differential-equation-specs
   [[:dqx-expr :dqx "dq_x/dt" "\\dot{q}_x"]
@@ -780,7 +882,7 @@
                            [k (safe-double (f (:qx s0) (:qy s0) (:px s0) (:py s0) md ad))])
                          fns))
         dt (when s1 (- (double (:t s1)) (double (:t s0))))
-        predicted-next (when dt (predict-step-rates fns s0 dt m alpha))]
+        predicted-next (when dt (symplectic-step-rates fns s0 dt m alpha))]
     {:index i
      :t (:t s0)
      :state (select-keys s0 [:qx :qy :px :py])
@@ -805,8 +907,9 @@
   (let [sc (resolve-scenario scenario)
         dataset (scenario-data sc)
         specs (case (:strategy individual)
-                :analytical analytical-equation-specs
+                :analytical   analytical-equation-specs
                 :differential differential-equation-specs
+                :conserved    conserved-equation-specs
                 nil)
         _ (when (nil? specs)
             (throw (ex-info "Unknown individual strategy" {:strategy (:strategy individual)})))
@@ -817,7 +920,8 @@
                  (when sample-t
                    (sample-analytical-at-t individual dataset sample-t))
                  :differential
-                 (sample-differential-at-index individual dataset sample-index))]
+                 (sample-differential-at-index individual dataset sample-index)
+                 :conserved nil)]
     {:strategy (:strategy individual)
      :format format
      :scenario-id (:id sc)
@@ -827,21 +931,20 @@
      :sample sample}))
 
 (def ops '[+ - * e/square e/sin e/cos e/div e/sqrt])
-(def analytical-vars (vec (concat '[t] ic-vars param-vars)))
+;; Derived variables pre-computed by compile-state-fn from initial conditions.
+;; r0/r02/r03/r05/r06 — initial radius powers (r₀¹,²,³,⁵,⁶)
+;; omega             — circular angular velocity sqrt(α/m/r₀³); exact for circular orbit
+;; omega-L           — actual initial angular velocity (q×p)/(m·r₀²); valid for any orbit
+(def analytical-derived-vars '[r0 r02 r03 r05 r06 omega omega-L])
+(def analytical-vars (vec (concat '[t] ic-vars param-vars analytical-derived-vars)))
 (def differential-vars (vec (concat state-vars param-vars derived-vars)))
-(def constants '[0.5 1.0 2.0])
 
-(def operators
-  {'+      {:arity 2 :fn e/+}
-   '-      {:arity 2 :fn e/-}
-   '*      {:arity 2 :fn e/*}
-   'e/div  {:arity 2 :fn (fn [a b] (if (< (Math/abs (double b)) 1e-6) 1.0 (e// a b)))}
-   'e/sin  {:arity 1 :fn e/sin}
-   'e/cos  {:arity 1 :fn e/cos}
-   'e/exp  {:arity 1 :fn (fn [x] (let [val (double x)]
-                                   (if (> val 20.0) (e/exp 20.0) (e/exp val))))} ;; Cap to avoid Inf
-   'e/square {:arity 1 :fn e/square}
-   'e/sqrt  {:arity 1 :fn e/sqrt}})
+;; Variables for conserved-quantity expressions: current state, params, and
+;; derived geometric variables (r, r2, r3 are pre-computed in compile-conserved-fn).
+(def conserved-vars (vec (concat state-vars param-vars derived-vars)))
+
+(def constants '[-1.0 -0.5 0.5 1.0 2.0 3.0])
+
 
 (defn- random-atom [vars]
   (rand-nth (concat vars constants)))
@@ -889,23 +992,246 @@
    required-differential-symbols
    #(genome-valid? %)))
 
+;; ── Conserved Quantity Strategy ───────────────────────────────────────────────
+;; Evolves a single expression C(qx, qy, px, py, m, α) that is constant along
+;; any trajectory — i.e., a conservation law.  Fitness = 1/(CoV+1) where
+;; CoV = std(C)/|mean(C)| along the trajectory.  Perfect conserved quantities
+;; (energy, angular momentum) achieve fitness ≈ 1.0.
+;;
+;; conserved-expr-key, conserved-genome-valid?, and compile-conserved-fn are
+;; defined earlier in the file so genome-valid? and evaluate-predictions
+;; can reference them without forward declarations.
+
+(defn random-conserved-individual []
+  (loop [n 0]
+    (let [expr (random-expression 4 conserved-vars)
+          ind  {:strategy :conserved conserved-expr-key expr}]
+      (if (or (conserved-genome-valid? ind) (> n 200))
+        ind
+        (recur (inc n))))))
+
+(defn- fitness-from-conserved
+  "fitness = 1 / (CoV + 1)  where CoV = std(C) / |mean(C)|.
+   Returns 0 if there are fewer than 3 finite values or the mean is near zero
+   (which would indicate a trivially-zero expression)."
+  [vals]
+  (let [finite (filterv #(Double/isFinite %) vals)
+        n      (count finite)]
+    (if (< n 3)
+      0.0
+      (let [mean     (/ (reduce + finite) n)
+            variance (/ (reduce (fn [s v] (let [d (- v mean)] (+ s (* d d)))) 0.0 finite) n)
+            std      (Math/sqrt variance)
+            abs-mean (Math/abs mean)]
+        (if (< abs-mean 1e-8)
+          0.0  ; expression evaluates to ~0 on this trajectory — not a useful invariant
+          (/ 1.0 (+ (/ std abs-mean) 1.0)))))))
+
+(defn- conserved-vals-for-dataset
+  "Evaluate compiled conserved fn over every state in dataset; return vector of doubles."
+  [c-fn {:keys [data m alpha]}]
+  (let [md (double m) ad (double alpha)]
+    (mapv (fn [{:keys [qx qy px py]}]
+            (safe-double (c-fn (double qx) (double qy) (double px) (double py) md ad)))
+          data)))
+
+(defn calculate-conserved-fitness
+  "Score a conserved-quantity individual on one trajectory dataset (per-trajectory CoV only).
+   Used internally; prefer calculate-conserved-fitness-scenarios for multi-dataset evaluation."
+  [ind dataset]
+  (try
+    (when (conserved-genome-valid? ind)
+      (fitness-from-conserved
+       (conserved-vals-for-dataset (compile-conserved-fn (:c-expr ind)) dataset)))
+    (catch Exception _ 0)))
+
+(defn- calculate-conserved-fitness-scenarios
+  "Full conserved-quantity fitness:
+   1. Compile expression once.
+   2. Per-trajectory: CoV = std/|mean| must be low (expression is constant on each orbit).
+   3. Cross-scenario: the per-trajectory mean must DIFFER across scenarios (not a universal
+      constant like cos(cos(1))).  If all per-trajectory means are the same, the expression
+      is trivially constant and earns fitness 0.
+   Returns worst per-trajectory fitness (min) after failing non-trivial cross-check."
+  [ind datasets]
+  (try
+    (when (conserved-genome-valid? ind)
+      (let [c-fn  (compile-conserved-fn (:c-expr ind))
+            ;; Evaluate on each trajectory, collect finite values and per-traj mean.
+            per-traj (mapv (fn [ds]
+                             (let [vals   (conserved-vals-for-dataset c-fn ds)
+                                   finite (filterv #(Double/isFinite %) vals)
+                                   n      (count finite)
+                                   mean   (when (>= n 1) (/ (reduce + finite) n))]
+                               {:vals finite :n n :mean mean}))
+                           datasets)
+            traj-means (keep :mean per-traj)
+            ;; Cross-scenario check: per-trajectory means must vary meaningfully.
+            ;; A trivially constant expression gives the same mean on every trajectory.
+            cross-ok?  (let [fmeans (filterv some? traj-means)
+                             n      (count fmeans)]
+                         (if (< n 2)
+                           false
+                           (let [cm   (/ (reduce + fmeans) n)
+                                 cstd (Math/sqrt
+                                       (/ (reduce (fn [s v] (+ s (* (- v cm) (- v cm)))) 0.0 fmeans) n))]
+                             ;; Require cross-scenario CoV > 10% — the per-trajectory mean
+                             ;; must differ noticeably across scenarios (i.e., depend on ICs).
+                             ;; This filters out trivial constants like px*K/px = K.
+                             (> (/ cstd (max 1e-10 (Math/abs cm))) 0.10))))]
+        (if-not cross-ok?
+          0.0
+          (apply min (map #(fitness-from-conserved (:vals %)) per-traj)))))
+    (catch Exception _ 0)))
+
+(def ^:dynamic *strategy-filter*
+  "When set to a keyword (:analytical, :differential, :conserved), random-individual
+   generates only that strategy.  nil (default) = uniform mix of all three."
+  nil)
+
 (defn random-individual []
-  (if (< (rand) 0.5)
-    (random-analytical-individual)
-    (random-differential-individual)))
+  (case *strategy-filter*
+    :analytical   (random-analytical-individual)
+    :differential (random-differential-individual)
+    :conserved    (random-conserved-individual)
+    (let [r (rand)]
+      (cond
+        (< r 0.34) (random-analytical-individual)
+        (< r 0.67) (random-differential-individual)
+        :else       (random-conserved-individual)))))
 
-(def terminals (vec (concat '[t] ic-vars param-vars [(fn [] (rand-nth [0.5 1.0 2.0]))])))
+;; ── Physics seeds ─────────────────────────────────────────────────────────────
+;; Hand-crafted individuals encoding known correct or near-correct physics.
+;; Injected into the initial population when --seed is passed so the GP can
+;; refine from a good starting point rather than discovering 1/r³ from scratch.
 
-(defn random-tree [max-depth]
-  (if (or (zero? max-depth) (< (rand) 0.3))
-    ;; Terminal node (Leaf)
-    (let [t (rand-nth terminals)]
-      (if (fn? t) (t) t))
-    ;; Operator node (Branch)
-    (let [op-name (rand-nth (keys operators))
-          arity   (get-in operators [op-name :arity])
-          children (repeatedly arity #(random-tree (dec max-depth)))]
-      (cons op-name children))))
+(def physics-seeds
+  "Seed individuals that express known gravitational physics (or close variants).
+   All expressions use (* -1.0 alpha) for negation since the GP only has binary
+   ops; unary (- alpha) would be mangled by simplify-expr."
+  [;; Exact Newtonian gravity: dq/dt = p/m, dp/dt = -α·q/r³
+   {:strategy :differential
+    :dqx-expr '(e/div px m)
+    :dqy-expr '(e/div py m)
+    :dpx-expr '(e/div (* (* -1.0 alpha) qx) r3)
+    :dpy-expr '(e/div (* (* -1.0 alpha) qy) r3)}
+   ;; Same but r3 written as r·r2 — different subtree structure for crossover diversity
+   {:strategy :differential
+    :dqx-expr '(e/div px m)
+    :dqy-expr '(e/div py m)
+    :dpx-expr '(e/div (* (* -1.0 alpha) qx) (* r r2))
+    :dpy-expr '(e/div (* (* -1.0 alpha) qy) (* r r2))}
+   ;; Perturbed coefficient -0.9 — lets evolution tune from slightly-off value
+   {:strategy :differential
+    :dqx-expr '(e/div px m)
+    :dqy-expr '(e/div py m)
+    :dpx-expr '(e/div (* (* -0.9 alpha) qx) r3)
+    :dpy-expr '(e/div (* (* -0.9 alpha) qy) r3)}
+   ;; Perturbed coefficient -1.1
+   {:strategy :differential
+    :dqx-expr '(e/div px m)
+    :dqy-expr '(e/div py m)
+    :dpx-expr '(e/div (* (* -1.1 alpha) qx) r3)
+    :dpy-expr '(e/div (* (* -1.1 alpha) qy) r3)}
+   ;; Alternative form: force = -alpha*(q/r)/r2 — different factorisation
+   {:strategy :differential
+    :dqx-expr '(e/div px m)
+    :dqy-expr '(e/div py m)
+    :dpx-expr '(e/div (* (* -1.0 alpha) (e/div qx r)) r2)
+    :dpy-expr '(e/div (* (* -1.0 alpha) (e/div qy r)) r2)}
+
+   ;; ── Analytical (short-horizon Taylor) seeds ───────────────────────────
+   ;; First-order: q(t) ≈ q₀ + (p₀/m)·t,  p(t) ≈ p₀ + F(q₀)·t
+   ;; r0/r02/r03 are pre-computed by compile-state-fn from initial position.
+   {:strategy :analytical
+    :qx-expr '(+ q0x (* (e/div p0x m) t))
+    :qy-expr '(+ q0y (* (e/div p0y m) t))
+    :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+    :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+
+   ;; Second-order: adds ½·F·t²/m correction to positions
+   ;; q(t) ≈ q₀ + (p₀/m)t − (α·q₀)/(2m·r₀³)·t²
+   {:strategy :analytical
+    :qx-expr '(+ q0x (+ (* (e/div p0x m) t) (* (e/div (* (* -0.5 alpha) q0x) (* m r03)) (* t t))))
+    :qy-expr '(+ q0y (+ (* (e/div p0y m) t) (* (e/div (* (* -0.5 alpha) q0y) (* m r03)) (* t t))))
+    :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+    :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+
+   ;; Circular rotation seed (exact for circular orbit, approximation for ellipse/hyperbola):
+   ;; q(t) = R(ωt)·q₀  where ω = sqrt(α/(m·r₀³)), pre-computed as `omega`.
+   ;; p(t) = m·ω·R(ωt+π/2)·q₀ = m·ω·(−sin,cos)·q₀
+   {:strategy :analytical
+    :qx-expr '(- (* q0x (e/cos (* omega t))) (* q0y (e/sin (* omega t))))
+    :qy-expr '(+ (* q0x (e/sin (* omega t))) (* q0y (e/cos (* omega t))))
+    :px-expr '(* (* -1.0 (* m omega)) (+ (* q0x (e/sin (* omega t))) (* q0y (e/cos (* omega t)))))
+    :py-expr '(* (* m omega) (- (* q0x (e/cos (* omega t))) (* q0y (e/sin (* omega t)))))}
+
+   ;; Angular-momentum rotation seed: uses the ACTUAL initial angular velocity Ω_L = L/(m·r₀²)
+   ;; where L = q₀×p₀ = q0x·p0y − q0y·p0x.  Better than circular-omega for eccentric orbits.
+   ;; Momentum follows from d/dt of the rotated position.
+   {:strategy :analytical
+    :qx-expr '(- (* q0x (e/cos (* omega-L t))) (* q0y (e/sin (* omega-L t))))
+    :qy-expr '(+ (* q0x (e/sin (* omega-L t))) (* q0y (e/cos (* omega-L t))))
+    :px-expr '(* (* -1.0 (* m omega-L)) (+ (* q0x (e/sin (* omega-L t))) (* q0y (e/cos (* omega-L t)))))
+    :py-expr '(* (* m omega-L) (- (* q0x (e/cos (* omega-L t))) (* q0y (e/sin (* omega-L t)))))}
+
+   ;; Taylor2 with 2nd-order momentum correction:
+   ;; q(t) ≈ q₀ + (p₀/m)t − ½·(α·q₀/m)·t²/r₀³
+   ;; p(t) ≈ p₀ + F₀·t + ½·(dF/dt)|₀·t²
+   ;; where dFx/dt|₀ = α·[(-1/r₀³ + 3q₀x²/r₀⁵)·p₀x + 3q₀x·q₀y·p₀y/r₀⁵] / m
+   {:strategy :analytical
+    :qx-expr '(+ q0x (+ (* (e/div p0x m) t) (* (e/div (* (* -0.5 alpha) q0x) (* m r03)) (* t t))))
+    :qy-expr '(+ q0y (+ (* (e/div p0y m) t) (* (e/div (* (* -0.5 alpha) q0y) (* m r03)) (* t t))))
+    :px-expr '(+ p0x (+ (* (e/div (* (* -1.0 alpha) q0x) r03) t)
+                        (* 0.5
+                           (* (e/div alpha (* m r05))
+                              (* (+ (* (- (* 3.0 (* q0x q0x)) r02) p0x)
+                                    (* (* 3.0 q0x) (* q0y p0y)))
+                                 t))
+                           t)))
+    :py-expr '(+ p0y (+ (* (e/div (* (* -1.0 alpha) q0y) r03) t)
+                        (* 0.5
+                           (* (e/div alpha (* m r05))
+                              (* (+ (* (- (* 3.0 (* q0y q0y)) r02) p0y)
+                                    (* (* 3.0 q0y) (* q0x p0x)))
+                                 t))
+                           t)))}
+
+   ;; Third-order momentum + second-order position seed:
+   ;; q(t) as before (2nd-order Taylor); p(t) adds 3rd-order correction.
+   ;; d³px/dt³|₀ ≈ α²·q₀x / (m·r₀⁶)   (circular-orbit approximation for the curvature term)
+   ;; This fixes the remaining 16% error in px for the circle scenario.
+   {:strategy :analytical
+    :qx-expr '(+ q0x (+ (* (e/div p0x m) t) (* (e/div (* (* -0.5 alpha) q0x) (* m r03)) (* t t))))
+    :qy-expr '(+ q0y (+ (* (e/div p0y m) t) (* (e/div (* (* -0.5 alpha) q0y) (* m r03)) (* t t))))
+    :px-expr '(+ p0x (+ (* (e/div (* (* -1.0 alpha) q0x) r03) t)
+                        (+ (* 0.5 (* (e/div alpha (* m r05))
+                                     (* (+ (* (- (* 3.0 (* q0x q0x)) r02) p0x)
+                                           (* (* 3.0 q0x) (* q0y p0y)))
+                                        t))
+                               t)
+                           (* (e/div (* alpha (* alpha q0x)) (* 6.0 (* m r06)))
+                              (* t (* t t))))))
+    :py-expr '(+ p0y (+ (* (e/div (* (* -1.0 alpha) q0y) r03) t)
+                        (+ (* 0.5 (* (e/div alpha (* m r05))
+                                     (* (+ (* (- (* 3.0 (* q0y q0y)) r02) p0y)
+                                           (* (* 3.0 q0y) (* q0x p0x)))
+                                        t))
+                               t)
+                           (* (e/div (* alpha (* alpha q0y)) (* 6.0 (* m r06)))
+                              (* t (* t t))))))}
+
+   ;; ── Conserved quantity seeds ──────────────────────────────────────────
+   ;; Angular momentum: L = qx·py − qy·px  (always conserved in central force)
+   {:strategy :conserved
+    :c-expr '(- (* qx py) (* qy px))}
+   ;; Energy: H = (px²+py²)/(2m) − α/r  (Hamiltonian, conserved by definition)
+   {:strategy :conserved
+    :c-expr '(- (e/div (+ (* px px) (* py py)) (* 2.0 m)) (e/div alpha r))}
+   ;; Kinetic energy alone — wrong but nearby in search space
+   {:strategy :conserved
+    :c-expr '(e/div (+ (* px px) (* py py)) (* 2.0 m))}])
+
 
 (defn- char-scale
   "Characteristic length scale of a dataset: RMS of |q| over the trajectory.
@@ -936,6 +1262,9 @@
             (/ 1.0 (+ (/ rmse (double D)) 1.0))))))))
 
 (defn calculate-analytical-fitness [ind dataset]
+  ;; Analytical expressions cannot predict full Keplerian trajectories (transcendental).
+  ;; We evaluate only the short-horizon portion where Taylor expansion approximations
+  ;; (q ≈ q₀ + v₀t + ½·F·t², p ≈ p₀ + F·t) are achievable by GP.
   (try
     (when (analytical-genome-valid? ind)
       (let [{:keys [data]} dataset
@@ -944,7 +1273,7 @@
                  :qy (compile-state-fn (:qy-expr ind))
                  :px (compile-state-fn (:px-expr ind))
                  :py (compile-state-fn (:py-expr ind))}
-            errors (horizon-errors-analytical fns dataset (all-horizon-times data))]
+            errors (horizon-errors-analytical fns dataset (short-horizon-times data))]
         (fitness-from-errors errors D)))
     (catch Exception _ 0)))
 
@@ -969,8 +1298,9 @@
   "dataset is a scenario map with :data, :m, :alpha."
   [individual dataset]
   (or (case (:strategy individual)
-        :analytical (calculate-analytical-fitness individual dataset)
+        :analytical   (calculate-analytical-fitness   individual dataset)
         :differential (calculate-differential-fitness individual dataset)
+        :conserved    (calculate-conserved-fitness    individual dataset)
         nil)
       0))
 
@@ -991,12 +1321,17 @@
 (defn calculate-fitness-scenarios
   "Robust fitness over scenario datasets: :min (worst case) or :percentile (e.g. p10).
 
+  For :conserved individuals, uses a combined per-trajectory + cross-scenario check
+  so trivially-constant expressions (e.g. cos(cos(qy/qy)) = const) score 0.
+
   Optional :aggregate and :percentile (see [[aggregate-scenario-fitness]])."
   [individual datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
-  (aggregate-scenario-fitness
-   (mapv #(calculate-fitness individual %) datasets)
-   :aggregate aggregate
-   :percentile percentile))
+  (if (= (:strategy individual) :conserved)
+    (or (calculate-conserved-fitness-scenarios individual datasets) 0.0)
+    (aggregate-scenario-fitness
+     (mapv #(calculate-fitness individual %) datasets)
+     :aggregate aggregate
+     :percentile percentile)))
 
 (defn- expr-subtrees [expr]
   (let [expr (normalize-expr expr)]
@@ -1006,8 +1341,10 @@
 
 (defn- slotted-subtrees [ind]
   (let [keys (case (:strategy ind)
-               :analytical analytical-expr-keys
-               :differential differential-expr-keys)]
+               :analytical   analytical-expr-keys
+               :differential differential-expr-keys
+               :conserved    [conserved-expr-key]
+               [])]
     (for [slot keys, st (expr-subtrees (get ind slot))]
       {:slot slot :motif st})))
 
@@ -1106,28 +1443,81 @@
      :motifs sorted
      :physics-hits physics-hits}))
 
+(defn- perturb-constants
+  "Walk an expression tree and jitter every numeric constant by ±20%.
+   Leaves zero as zero to avoid introducing small biases."
+  [expr]
+  (normalize-expr
+   (cond
+     (and (number? expr) (not (zero? expr)))
+     (* expr (+ 1.0 (* 0.4 (- (rand) 0.5))))   ; ×(0.8 … 1.2)
+     (coll? expr)
+     (apply list (first expr) (map perturb-constants (rest expr)))
+     :else expr)))
+
 (defn mutate
   ([expr] (mutate expr analytical-vars))
   ([expr vars]
    (normalize-expr
-    (if (< (rand) 0.2)
-      (random-expression 2 vars)
-      (if (coll? expr)
+    (let [r (rand)]
+      (cond
+        ;; 15% — replace whole subtree with a fresh random expression
+        (< r 0.15) (random-expression 2 vars)
+        ;; 10% — jitter all numeric constants in the expression
+        (< r 0.25) (perturb-constants expr)
+        ;; 75% — recurse into children, mutating each independently
+        (coll? expr)
         (let [op (first expr)]
-          (cons op (mapv #(if (coll? %) (mutate % vars) %) (rest expr))))
-        expr)))))
+          (cons op (mapv #(mutate % vars) (rest expr))))
+        :else expr)))))
+
+(defn- validate-and-repair
+  "Simplify, detect degenerate (constant) sub-expressions, and ensure required
+   symbols survive after mutation/crossover."
+  [ind]
+  (let [strategy (:strategy ind)
+        [ks vars] (case strategy
+                    :analytical   [analytical-expr-keys   analytical-vars]
+                    :differential [differential-expr-keys differential-vars]
+                    :conserved    [[conserved-expr-key]   conserved-vars]
+                    [nil nil])
+        ;; 1. Simplify every expression in the genome; replace any that collapsed
+        ;;    to a pure constant (e.g. (- py py) → 0) with a fresh random expr.
+        ind' (if ks
+               (reduce (fn [acc k]
+                         (let [simplified (simplify-expr (get acc k))]
+                           (assoc acc k
+                                  (if (number? simplified)
+                                    (random-expression 3 vars)
+                                    simplified))))
+                       ind ks)
+               ind)
+        ;; 2. Re-inject any required symbols that were lost.
+        ind'' (case strategy
+                :analytical   (-> ind'
+                                  (ensure-symbol-coverage ks required-analytical-symbols)
+                                  ensure-analytical-uses-t)
+                :differential (ensure-symbol-coverage ind' ks required-differential-symbols)
+                :conserved    (if (conserved-genome-valid? ind')
+                                ind'
+                                (random-conserved-individual))
+                ind')]
+    ind''))
 
 (defn mutate-individual [ind]
-  (if (< (rand) 0.2)
-    (random-individual)
-    (case (:strategy ind)
-      :analytical (into {:strategy :analytical}
-                        (map (fn [k] [k (mutate (get ind k) analytical-vars)])
-                             analytical-expr-keys))
-      :differential (into {:strategy :differential}
-                          (map (fn [k] [k (mutate (get ind k) differential-vars)])
-                               differential-expr-keys))
-      (random-individual))))
+  (-> (if (< (rand) 0.2)
+        (random-individual)
+        (case (:strategy ind)
+          :analytical   (into {:strategy :analytical}
+                              (map (fn [k] [k (mutate (get ind k) analytical-vars)])
+                                   analytical-expr-keys))
+          :differential (into {:strategy :differential}
+                              (map (fn [k] [k (mutate (get ind k) differential-vars)])
+                                   differential-expr-keys))
+          :conserved    {:strategy :conserved
+                         conserved-expr-key (mutate (get ind conserved-expr-key) conserved-vars)}
+          (random-individual)))
+      validate-and-repair))
 
 ;; ── Cross-pollination (GP crossover) ─────────────────────────────────────────
 
@@ -1172,22 +1562,25 @@
           ks       (case strategy
                      :analytical   analytical-expr-keys
                      :differential differential-expr-keys
+                     :conserved    [conserved-expr-key]
                      nil)
           vars     (case strategy
                      :analytical   analytical-vars
                      :differential differential-vars
+                     :conserved    conserved-vars
                      nil)]
       (when ks
-        (into {:strategy strategy}
-              (map (fn [k]
-                     (let [ea (get ind-a k) eb (get ind-b k)
-                           r  (rand)
-                           child (cond
-                                   (< r 0.25) ea
-                                   (< r 0.50) eb
-                                   :else      (crossover-expr ea eb))]
-                       [k (mutate child vars)]))
-                   ks))))))
+        (-> (into {:strategy strategy}
+                  (map (fn [k]
+                         (let [ea (get ind-a k) eb (get ind-b k)
+                               r  (rand)
+                               child (cond
+                                       (< r 0.25) ea
+                                       (< r 0.50) eb
+                                       :else      (crossover-expr ea eb))]
+                           [k (mutate child vars)]))
+                       ks))
+            validate-and-repair)))))
 
 
 (def default-population-file "data/population.edn")
@@ -1234,8 +1627,9 @@
 (defn- individual-for-save [ind]
   (let [norm (fn [k] [k (normalize-expr (get ind k))])]
     (case (:strategy ind)
-      :analytical (into {:strategy :analytical} (map norm analytical-expr-keys))
+      :analytical   (into {:strategy :analytical}   (map norm analytical-expr-keys))
       :differential (into {:strategy :differential} (map norm differential-expr-keys))
+      :conserved    (into {:strategy :conserved}    [(norm conserved-expr-key)])
       (into {:strategy (:strategy ind)}
             (map norm (concat analytical-expr-keys differential-expr-keys))))))
 
@@ -1267,34 +1661,56 @@
           nil)))))
 
 (defn normalize-population-size
-  "Pad with random individuals or trim so size matches the configured target."
+  "Sanitize, pad with random individuals, or trim so size matches the configured target.
+   Also runs validate-and-repair on every loaded individual so degenerate genomes
+   (e.g. (- py py) = 0 from old checkpoints) are cleaned up before evolution starts."
   [population target-size]
-  (let [n (count population)]
+  (let [sanitized (mapv validate-and-repair population)
+        n         (count sanitized)]
     (cond
       (zero? target-size) []
-      (<= n target-size) (into population (repeatedly (- target-size n) random-individual))
-      :else (subvec (vec population) 0 target-size))))
+      (<= n target-size) (into sanitized (repeatedly (- target-size n) random-individual))
+      :else (subvec sanitized 0 target-size))))
+
+(defn- splice-seeds
+  "Replace the last (count seeds) slots in population with physics-seed individuals,
+   so seeds always enter the first generation regardless of checkpoint state."
+  [population seeds]
+  (let [pop   (vec population)
+        n     (count pop)
+        ns    (min (count seeds) n)
+        seeds (vec (take ns seeds))]
+    (into (subvec pop 0 (- n ns)) seeds)))
 
 (defn resolve-initial-population
-  [{:keys [fresh? path population-size]}]
-  (if fresh?
-    {:population (vec (repeatedly population-size random-individual))
-     :generations-run 0
-     :resumed? false}
-    (if-let [{:keys [population generations-run]} (load-population path)]
-      {:population population
-       :generations-run generations-run
-       :resumed? true}
-      {:population (vec (repeatedly population-size random-individual))
-       :generations-run 0
-       :resumed? false})))
+  [{:keys [fresh? seed? path population-size strategy]}]
+  (let [;; Filter seeds to the active strategy (nil = keep all).
+        seeds (when seed?
+                (cond->> physics-seeds
+                  strategy (filterv #(= (:strategy %) strategy))))
+        base  (if fresh?
+                {:population (vec (repeatedly population-size random-individual))
+                 :generations-run 0
+                 :resumed? false}
+                (if-let [{:keys [population generations-run]} (load-population path)]
+                  {:population population
+                   :generations-run generations-run
+                   :resumed? true}
+                  {:population (vec (repeatedly population-size random-individual))
+                   :generations-run 0
+                   :resumed? false}))]
+    (if (seq seeds)
+      (do (println (str "Injecting " (count seeds) " physics seeds into initial population."))
+          (update base :population splice-seeds seeds))
+      base)))
 
 (def default-mcts-simulations 64)
 (def default-mcts-inject 5)
 
 (defn parse-args
   [args]
-  (loop [opts {:fresh? false
+  (loop [opts         {:fresh? false
+               :seed? false
                :path default-population-file
                :generations 50
                :population-size 50
@@ -1307,7 +1723,8 @@
                :scenario-samples 32
                :fitness-aggregate :min
                :fitness-percentile 10
-               :scenario-seed nil}
+               :scenario-seed nil
+               :strategy nil}        ; nil = all strategies; or :analytical/:differential/:conserved
          xs args]
     (if (empty? xs)
       (assoc opts :fitness-context
@@ -1319,6 +1736,7 @@
       (let [[a & more] xs]
         (case a
           "--fresh" (recur (assoc opts :fresh? true) more)
+          "--seed"  (recur (assoc opts :seed? true) more)
           "--no-mcts" (recur (assoc opts :mcts? false) more)
           "--mcts-until-stop" (recur (assoc opts :mcts-until-stop true) more)
           "--prompt-each-generation" (recur (assoc opts :prompt-each-generation true) more)
@@ -1333,17 +1751,18 @@
           "--population" (recur (assoc opts :path (first more)) (rest more))
           "--generations" (recur (assoc opts :generations (Long/parseLong (first more))) (rest more))
           "--population-size" (recur (assoc opts :population-size (Long/parseLong (first more))) (rest more))
+          "--strategy" (recur (assoc opts :strategy (keyword (first more))) (rest more))
           (throw (ex-info "Unknown argument"
                           {:arg a
                            :hint "--fresh --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-mcts ..."})))))))
 
 (defn evolve-generation
-  [population fitness-ctx population-size generation-index]
-  (let [datasets   (datasets-for-fitness-context fitness-ctx :generation generation-index)
-        fit-opts   (select-keys fitness-ctx [:aggregate :percentile])
-        ;; 10% fresh random immigrants each generation — floor of diversity that
-        ;; prevents complete clonal collapse regardless of selection pressure.
-        immigrant-n (max 1 (quot population-size 10))
+  [population fitness-ctx population-size generation-index
+   & {:keys [extra-immigrants] :or {extra-immigrants 0}}]
+  (let [datasets    (datasets-for-fitness-context fitness-ctx :generation generation-index)
+        fit-opts    (select-keys fitness-ctx [:aggregate :percentile])
+        ;; 10% fresh random immigrants each generation (+ extras during stagnation).
+        immigrant-n (+ (max 1 (quot population-size 10)) extra-immigrants)
         elite-cap   (max 1 (quot population-size 5))
         scored      (->> population
                          (map (fn [ind]
@@ -1356,25 +1775,27 @@
         ;; can only contribute one elite slot, not all of them.
         unique-elites (take elite-cap (distinct scored))
         n-elites      (count unique-elites)
-        breed-slots   (- population-size immigrant-n)
+        breed-slots   (max 0 (- population-size immigrant-n))
         branch        (long (Math/ceil (/ breed-slots (double n-elites))))]
     (vec (take population-size
                (concat
-                ;; Elites + their offspring (crossover or mutation)
-                (mapcat (fn [parent]
-                          (cons parent
-                                (take (dec branch)
-                                      (repeatedly
-                                       #(if (and (> (count unique-elites) 1) (< (rand) 0.7))
-                                          ;; Cross-pollination: breed with a randomly chosen
-                                          ;; different elite; fall back to mutation if strategies differ.
-                                          (let [other (rand-nth (remove #{parent} unique-elites))]
-                                            (or (crossover-individuals parent other)
-                                                (mutate-individual parent)))
-                                          ;; Pure mutation
-                                          (mutate-individual parent))))))
-                        unique-elites)
-                ;; Fresh random immigrants — keeps the gene pool open
+                ;; Elites + their offspring (crossover or mutation).
+                ;; Capped at breed-slots so immigrants always get their reserved slots.
+                (take breed-slots
+                      (mapcat (fn [parent]
+                                (cons parent
+                                      (take (dec branch)
+                                            (repeatedly
+                                             #(if (and (> (count unique-elites) 1) (< (rand) 0.7))
+                                                ;; Cross-pollination with a randomly chosen
+                                                ;; different elite; fall back to mutation if
+                                                ;; strategies differ.
+                                                (let [other (rand-nth (remove #{parent} unique-elites))]
+                                                  (or (crossover-individuals parent other)
+                                                      (mutate-individual parent)))
+                                                (mutate-individual parent))))))
+                              unique-elites))
+                ;; Fresh random immigrants — guaranteed to appear every generation.
                 (repeatedly immigrant-n random-individual))))))
 
 (defn- prompt-continue-evolution? []
@@ -1384,14 +1805,18 @@
 
 (defn -main [& args]
   (timbre/merge-config! {:min-level :warn})
-  (let [{:keys [fresh? path generations population-size prompt-each-generation
-                fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile]}
-        (parse-args args)
-        report-scenarios default-scenarios
+  (let [{:keys [fresh? seed? path generations population-size prompt-each-generation
+                fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile
+                strategy]}
+        (parse-args args)]
+  (binding [*strategy-filter* strategy]
+  (let [report-scenarios default-scenarios
         {:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
+                                     :seed?  seed?
                                      :path path
-                                     :population-size population-size})
+                                     :population-size population-size
+                                     :strategy strategy})
         initial (normalize-population-size population population-size)
         fit-opts (select-keys fitness-context [:aggregate :percentile])
         stopped-early? (atom false)
@@ -1411,15 +1836,23 @@
         ref-datasets (scenarios->datasets default-scenarios)
         ;; Hall-of-fame: best individual ever seen by eval fitness. Injected every generation
         ;; so it can never be lost to random-batch variance.
-        hall-of-fame (atom nil)
+        hall-of-fame  (atom nil)
+        ;; Stagnation tracking: count consecutive gens without HoF improvement.
+        stagnation    (atom 0)
+        stagnation-threshold 20   ; gens of flat HoF before doubling immigrants
         final-pop (reduce
                    (fn [pop gen-idx]
                      ;; Inject the hall-of-fame individual into the pool before evolving so it
                      ;; competes for elite slots on the new batch (replacing the last slot).
-                     (let [pop-with-hof (if-let [hof @hall-of-fame]
-                                          (assoc (vec pop) (dec (count pop)) (:ind hof))
-                                          pop)
-                           pop' (evolve-generation pop-with-hof fitness-context population-size gen-idx)
+                     (let [prev-hof-fitness (or (:eval-fitness @hall-of-fame) 0.0)
+                           stagnating?      (>= @stagnation stagnation-threshold)
+                           ;; During stagnation: double immigrants to boost diversity.
+                           extra-imm        (if stagnating? (quot population-size 10) 0)
+                           pop-with-hof     (if-let [hof @hall-of-fame]
+                                              (assoc (vec pop) (dec (count pop)) (:ind hof))
+                                              pop)
+                           pop' (evolve-generation pop-with-hof fitness-context population-size gen-idx
+                                                   :extra-immigrants extra-imm)
                            gens (+ generations-run (inc gen-idx))
                            {:keys [best mean median]} (population-fitness-stats pop')
                            ;; Eval every elite individual on the fixed reference scenarios and
@@ -1438,18 +1871,23 @@
                            _ (when (and eval-best
                                         (or (nil? @hall-of-fame)
                                             (> eval-best (:eval-fitness @hall-of-fame))))
-                               (reset! hall-of-fame {:ind best-eval-ind :eval-fitness eval-best}))]
+                               (reset! hall-of-fame {:ind best-eval-ind :eval-fitness eval-best}))
+                           ;; Update stagnation counter.
+                           _ (if (> (or (:eval-fitness @hall-of-fame) 0.0) prev-hof-fitness)
+                               (reset! stagnation 0)
+                               (swap! stagnation inc))]
                        (save-checkpoint! pop' gens)
                        (swap! history conj {:gen (inc gen-idx) :total-gen gens
                                             :best best :mean mean :median median
                                             :eval-best eval-best
                                             :hof-best (:eval-fitness @hall-of-fame)})
                        (save-history! history-path @history)
-                       (println (format "  gen %d/%d  train-best=%.4f  eval-best=%.4f  hof=%.4f  mean=%.4f  saved"
+                       (println (format "  gen %d/%d  train-best=%.4f  eval-best=%.4f  hof=%.4f  mean=%.4f%s  saved"
                                         (inc gen-idx) generations best
                                         (or eval-best 0.0)
                                         (or (:eval-fitness @hall-of-fame) 0.0)
-                                        mean))
+                                        mean
+                                        (if stagnating? (str "  [stag=" @stagnation "]") "")))
                        (if (and prompt-each-generation
                                 (< gen-idx (dec generations))
                                 (not (prompt-continue-evolution?)))
@@ -1473,7 +1911,9 @@
     (println (if resumed? "resumed from" "finished; checkpoint") path)
     (println "total generations (cumulative):" total-generations)
     (println (str "fitness mode: " (name fitness-mode)
-                  " | samples/gen: " scenario-samples
+                  " | scenarios/gen: " (if (= fitness-mode :fixed)
+                                         (count default-scenarios)
+                                         scenario-samples)
                   " | aggregate: " (name fitness-aggregate)
                   (when (= fitness-aggregate :percentile)
                     (str " | p" fitness-percentile))))
@@ -1491,10 +1931,12 @@
         :differential
         (doseq [k differential-expr-keys]
           (println (str "    " (name k) ":" (pr-str (normalize-expr (get ind k))))))
+        :conserved
+        (println (str "    c-expr:" (pr-str (normalize-expr (get ind conserved-expr-key)))))
         (println "    (unknown strategy)")))
     (println "\nBest on fixed reference scenarios (MSE):")
     (doseq [scenario report-scenarios]
       (let [dataset (scenario-data scenario)
             metrics (evaluate-predictions best dataset)]
         (println (str "  " (name (:id scenario)) " " (name (:strategy metrics))
-                      " mse=" (format "%.6f" (:mse metrics))))))))
+                      " mse=" (format "%.6f" (:mse metrics))))))))))
