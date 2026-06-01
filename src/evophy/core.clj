@@ -577,12 +577,16 @@
 
 (defn- conserved-genome-valid?
   "A conserved-quantity genome must use at least one dynamic state variable
-   (qx, qy, px, py) so trivially-constant expressions (just m, alpha, etc.) are rejected."
+   (qx, qy, px, py) so trivially-constant or parameter-only expressions are rejected.
+   We check the SIMPLIFIED form — GP sometimes hides px in canceling terms like
+   (+ alpha px) - (c + px) which simplify to a constant."
   [ind]
-  (let [expr (get ind conserved-expr-key)]
+  (let [expr     (get ind conserved-expr-key)
+        sexpr    (when (some? expr) (simplify-expr expr))]
     (and (some? expr)
-         (not (number? (simplify-expr expr)))
-         (some #(expr-uses-symbol? expr %) state-vars))))
+         (not (number? sexpr))
+         ;; Reject if simplification removed ALL state variables (e.g. (- (+ alpha px) (+ c px)))
+         (some #(expr-uses-symbol? sexpr %) state-vars))))
 
 (defn genome-valid?
   "Analytical: each expr uses t; ICs and (m, α) appear across trajectory laws.
@@ -1050,10 +1054,12 @@
   "Full conserved-quantity fitness:
    1. Compile expression once.
    2. Per-trajectory: CoV = std/|mean| must be low (expression is constant on each orbit).
-   3. Cross-scenario: the per-trajectory mean must DIFFER across scenarios (not a universal
-      constant like cos(cos(1))).  If all per-trajectory means are the same, the expression
-      is trivially constant and earns fitness 0.
-   Returns worst per-trajectory fitness (min) after failing non-trivial cross-check."
+   3. IC-group check: means must differ across scenarios sharing the SAME (m, alpha).
+      This rejects expressions like 'alpha + c' that are parameter-only functions:
+      they pass the old CoV-across-all-scenarios check because alpha varies between
+      scenarios, but are constant within any iso-parameter group.
+   4. Global cross-scenario check as a secondary safety net.
+   Returns worst per-trajectory fitness after all checks pass."
   [ind datasets]
   (try
     (when (conserved-genome-valid? ind)
@@ -1064,23 +1070,37 @@
                                    finite (filterv #(Double/isFinite %) vals)
                                    n      (count finite)
                                    mean   (when (>= n 1) (/ (reduce + finite) n))]
-                               {:vals finite :n n :mean mean}))
+                               {:vals finite :n n :mean mean :m (:m ds) :alpha (:alpha ds)}))
                            datasets)
             traj-means (keep :mean per-traj)
-            ;; Cross-scenario check: per-trajectory means must vary meaningfully.
-            ;; A trivially constant expression gives the same mean on every trajectory.
-            cross-ok?  (let [fmeans (filterv some? traj-means)
+            ;; IC-group variation check: among scenarios that share (m, alpha), the
+            ;; expression's mean must differ noticeably (it must depend on ICs, not just params).
+            ;; Group by [m alpha] and check at least one group has CoV > 5% among its members.
+            ic-group-ok?
+            (let [groups (->> per-traj
+                              (group-by (fn [{:keys [m alpha]}]
+                                          [(double m) (double alpha)]))
+                              vals
+                              (filter #(>= (count %) 2)))]
+              (or (empty? groups)      ; only one scenario per param-combo → skip check
+                  (some (fn [grp]
+                          (let [ms (keep :mean grp)
+                                n  (count ms)]
+                            (when (>= n 2)
+                              (let [gm   (/ (reduce + ms) n)
+                                    gstd (Math/sqrt
+                                          (/ (reduce (fn [s v] (+ s (* (- v gm) (- v gm)))) 0.0 ms) n))]
+                                (> (/ gstd (max 1e-10 (Math/abs gm))) 0.05)))))
+                        groups)))
+            ;; Global cross-scenario check as secondary safety net.
+            global-ok? (let [fmeans (filterv some? traj-means)
                              n      (count fmeans)]
-                         (if (< n 2)
-                           false
-                           (let [cm   (/ (reduce + fmeans) n)
-                                 cstd (Math/sqrt
-                                       (/ (reduce (fn [s v] (+ s (* (- v cm) (- v cm)))) 0.0 fmeans) n))]
-                             ;; Require cross-scenario CoV > 10% — the per-trajectory mean
-                             ;; must differ noticeably across scenarios (i.e., depend on ICs).
-                             ;; This filters out trivial constants like px*K/px = K.
-                             (> (/ cstd (max 1e-10 (Math/abs cm))) 0.10))))]
-        (if-not cross-ok?
+                         (and (>= n 2)
+                              (let [cm   (/ (reduce + fmeans) n)
+                                    cstd (Math/sqrt
+                                          (/ (reduce (fn [s v] (+ s (* (- v cm) (- v cm)))) 0.0 fmeans) n))]
+                                (> (/ cstd (max 1e-10 (Math/abs cm))) 0.05))))]
+        (if-not (and ic-group-ok? global-ok?)
           0.0
           (apply min (map #(fitness-from-conserved (:vals %)) per-traj)))))
     (catch Exception _ 0)))
