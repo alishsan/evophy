@@ -415,10 +415,11 @@
   (vec (distinct (map :t (filter #(pos? (double (:t %))) data)))))
 
 (defn- short-horizon-times
-  "Times covering only the first `frac` of the trajectory (default 15%).
+  "Times covering only the first `frac` of the trajectory (default 8%).
    Analytical expressions can't predict full Keplerian orbits (transcendental),
-   but Taylor expansion approximations work well for short horizons."
-  ([data] (short-horizon-times data 0.15))
+   but Taylor expansion approximations work well for short horizons.
+   At 8%, the circle arc is ~27° where even 2nd-order Taylor gives <2% error."
+  ([data] (short-horizon-times data 0.08))
   ([data frac]
    (let [ts (all-horizon-times data)
          n  (max 1 (int (Math/ceil (* frac (count ts)))))]
