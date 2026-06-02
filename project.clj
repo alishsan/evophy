@@ -12,5 +12,6 @@
   :main evophy.core
   :target-path "target/%s"
   :aliases {"fitness-progress"  ["run" "-m" "clojure.main" "dev/fitness_progress.clj"]
-            "top-expressions"   ["run" "-m" "clojure.main" "dev/top_expressions.clj"]}
+            "top-expressions"   ["run" "-m" "clojure.main" "dev/top_expressions.clj"]
+            "debug-fit"         ["run" "-m" "clojure.main" "dev/debug_fit.clj"]}
   :profiles {:uberjar {:aot [evophy.core]}})

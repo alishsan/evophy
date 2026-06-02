@@ -3,7 +3,7 @@
 
 (def pop-path      "data/population.edn")
 (def top-n         5)
-(def eval-timeout-ms 1500)
+(def eval-timeout-ms 5000)
 
 (defn- safe-fitness
   "Score one individual with a timeout; returns 0.0 on timeout or error."
@@ -15,10 +15,14 @@
 
 (defn- print-individual [i ind datasets]
   (try
-    (let [eq (c/individual->equations ind :format :plain)]
+    (let [eq      (c/individual->equations ind :format :plain)
+          metrics (:metrics eq)
+          ;; conserved strategy uses squared-CoV instead of MSE
+          metric-label (if (= (:strategy ind) :conserved) "cov²" "mse")
+          metric-val   (format "%.6f" (double (:mse metrics)))]
       (println (str "#" (inc i)
                     "  strategy=" (name (:strategy eq))
-                    "  mse=" (format "%.6f" (:mse (:metrics eq)))
+                    "  " metric-label "=" metric-val
                     "  fitness=" (format "%.4f" (:fitness ind))))
       (doseq [[_ line] (sort-by key (:equations eq))]
         (println (str "    " line)))
@@ -58,9 +62,11 @@
           deduped  (distinct ranked)
           top-all  (take top-n deduped)
           top-diff (take top-n (filter #(= :differential (:strategy %)) deduped))
-          top-anal (take top-n (filter #(= :analytical   (:strategy %)) deduped))]
+          top-anal (take top-n (filter #(= :analytical   (:strategy %)) deduped))
+          top-cons (take top-n (filter #(= :conserved    (:strategy %)) deduped))]
       (println (str "Loaded " total
                     " individuals  |  total generations: " (:generations-run loaded) "\n"))
       (print-section (str "Top " top-n " overall (any strategy)") top-all  datasets)
       (print-section (str "Top " top-n " differential")           top-diff datasets)
+      (print-section (str "Top " top-n " conserved quantities")   top-cons datasets)
       (print-section (str "Top " top-n " analytical")             top-anal datasets))))
