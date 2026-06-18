@@ -208,3 +208,14 @@
                                                        :population-size 1}))))
       (finally
         (.delete (io/file path))))))
+
+(deftest functional-blocks-smoke
+  "Fast structural smoke for block abstraction + guess mutation (no fitness eval)."
+  (let [ab (abstract-block '(- (* qx py) (* qy px)))]
+    (is (:angular? ab))
+    (is (not (:trig? ab))))
+  (let [junk {:strategy :conserved
+              :c-expr '(+ (e/sin (e/sqrt r)) (* m m))}]
+    (is (boolean
+         (some #(not= (:c-expr junk) (:c-expr %))
+               (repeatedly 8 #(guess-mutate-individual junk)))))))

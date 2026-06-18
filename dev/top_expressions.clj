@@ -17,8 +17,7 @@
   (try
     (let [eq      (c/individual->equations ind :format :plain)
           metrics (:metrics eq)
-          ;; conserved strategy uses squared-CoV instead of MSE
-          metric-label (if (= (:strategy ind) :conserved) "cov²" "mse")
+          metric-label "mse"
           metric-val   (format "%.6f" (double (:mse metrics)))]
       (println (str "#" (inc i)
                     "  strategy=" (name (:strategy eq))

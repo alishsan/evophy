@@ -64,7 +64,29 @@
                       :else (list 'e/div a b)))
                   (cons op args)))
               x))]
-    (simp expr)))
+    (let [match-cancel-mul (fn [x]
+                              (when (and (sequential? x) (= (first x) '*))
+                                (let [[_ a rhs] x]
+                                  (when (and (sequential? rhs) (= (first rhs) '-))
+                                    (let [[_ num y] rhs]
+                                      (when (and (sequential? num)
+                                                 (= (first num) 'e/div)
+                                                 (= (nth num 2) a))
+                                        (list '- (nth num 1) (list '* a y))))))))
+          s (simp expr)]
+      (cond
+        (number? s) s
+        (= s 0) 0
+        ;; (+ a (- k a)) → k
+        (and (sequential? s) (= (first s) '+))
+        (let [[_ a b] s]
+          (cond
+            (and (sequential? b) (= (first b) '-)
+                 (= (nth b 1) a)) (nth b 2)
+            (and (sequential? a) (= (first a) '-)
+                 (= (nth a 1) b)) (nth a 2)
+            :else s))
+        :else (or (match-cancel-mul s) s)))))
 
 (defn grav2d-energy
   "H = (px² + py²)/(2m) − α/r,  r = √(qx² + qy²)."
@@ -575,18 +597,64 @@
   (and (every? #(expr-uses-t? (get ind %)) analytical-expr-keys)
        (symbols-covered-across-exprs? analytical-expr-keys ind required-analytical-symbols)))
 
+(declare conserved-vals-for-dataset conserved-dot-vals-for-dataset)
+
+(defn- conserved-per-traj-means
+  "Per-trajectory mean of conserved expression over datasets."
+  [c-fn datasets]
+  (mapv (fn [ds]
+          (let [vals   (conserved-vals-for-dataset c-fn ds)
+                finite (filterv #(Double/isFinite %) vals)
+                n      (count finite)]
+            (when (pos? n) (/ (reduce + finite) n))))
+        datasets))
+
+(defn- ic-group-variation-ok?
+  "True when at least one (m, α) group has ≥2 scenarios whose per-trajectory
+   means differ by >5% CoV — the expression must depend on initial conditions,
+   not just parameters.  Returns false when no qualifying groups exist."
+  [c-fn datasets]
+  (let [groups (->> datasets
+                    (map (fn [ds] {:m (:m ds) :alpha (:alpha ds) :ds ds}))
+                    (group-by (fn [{:keys [m alpha]}] [(double m) (double alpha)]))
+                    vals
+                    (filter #(>= (count %) 2)))]
+    (and (seq groups)
+         (some (fn [grp]
+                 (let [ms (keep identity (conserved-per-traj-means c-fn (map :ds grp)))
+                       n  (count ms)]
+                   (when (>= n 2)
+                     (let [gm   (/ (reduce + ms) n)
+                           gstd (Math/sqrt
+                                 (/ (reduce (fn [s v] (+ s (* (- v gm) (- v gm)))) 0.0 ms) n))]
+                       (> (/ gstd (max 1e-10 (Math/abs gm))) 0.05)))))
+               groups))))
+
+(defn- expr-uses-position? [expr]
+  (or (some #(expr-uses-symbol? expr %) '[qx qy])
+      (some #(expr-uses-symbol? expr %) derived-vars)))
+
 (defn- conserved-genome-valid?
   "A conserved-quantity genome must use at least one dynamic state variable
    (qx, qy, px, py) so trivially-constant or parameter-only expressions are rejected.
    We check the SIMPLIFIED form — GP sometimes hides px in canceling terms like
-   (+ alpha px) - (c + px) which simplify to a constant."
+   (+ alpha px) - (c + px) which simplify to a constant.
+   Also requires at least one position (qx/qy or derived r/r2/r3) AND one momentum
+   (px/py) so qx-only flat functions cannot pass both CoV and ∇C·f checks.
+   Requires IC dependence on the fixed reference scenarios (not just m or α)."
   [ind]
-  (let [expr     (get ind conserved-expr-key)
-        sexpr    (when (some? expr) (simplify-expr expr))]
+  (let [expr  (get ind conserved-expr-key)
+        sexpr (when (some? expr) (simplify-expr expr))]
     (and (some? expr)
          (not (number? sexpr))
-         ;; Reject if simplification removed ALL state variables (e.g. (- (+ alpha px) (+ c px)))
-         (some #(expr-uses-symbol? sexpr %) state-vars))))
+         (some #(expr-uses-symbol? sexpr %) state-vars)
+         (expr-uses-position? sexpr)
+         (some #(expr-uses-symbol? sexpr %) '[px py])
+         (try
+           (ic-group-variation-ok?
+            (compile-conserved-fn expr)
+            (scenarios->datasets default-scenarios))
+           (catch Exception _ false)))))
 
 (defn genome-valid?
   "Analytical: each expr uses t; ICs and (m, α) appear across trajectory laws.
@@ -646,59 +714,109 @@
        :m (double m)
        :alpha (double alpha)})))
 
+(defn- conserved-probes-from-dataset [dataset]
+  (let [{:keys [data m alpha]} dataset
+        n (count data)]
+    (for [i (sample-trajectory-indices n)
+          :let [s (nth data i)]]
+      {:qx (double (:qx s))
+       :qy (double (:qy s))
+       :px (double (:px s))
+       :py (double (:py s))
+       :m (double m)
+       :alpha (double alpha)})))
+
+(defn- conserved-probes-lite-from-dataset
+  "One probe per scenario — enough to distinguish near-constant hacks, much cheaper than full sampling."
+  [dataset]
+  (when-let [s (first (:data dataset))]
+    [{:qx (double (:qx s))
+      :qy (double (:qy s))
+      :px (double (:px s))
+      :py (double (:py s))
+      :m (double (:m dataset))
+      :alpha (double (:alpha dataset))}]))
+
 (defn build-behavior-probes
   "Probe tuples sampled from integrated scenarios — used to hash individuals by outputs, not syntax."
   [datasets]
   {:differential (vec (distinct (mapcat differential-probes-from-dataset datasets)))
-   :analytical (vec (distinct (mapcat analytical-probes-from-dataset datasets)))})
+   :analytical   (vec (distinct (mapcat analytical-probes-from-dataset datasets)))
+   :conserved    (vec (distinct (mapcat conserved-probes-from-dataset datasets)))})
+
+(defn build-behavior-probes-lite
+  "Fewer probe points for per-generation escape/dedup (not final reporting)."
+  [datasets]
+  {:differential (vec (mapcat #(take 1 (differential-probes-from-dataset %)) datasets))
+   :analytical   (vec (mapcat #(take 1 (analytical-probes-from-dataset %)) datasets))
+   :conserved    (vec (mapcat conserved-probes-lite-from-dataset datasets))})
+
+(defn- ^java.util.Map behavior-key-cache []
+  (java.util.HashMap.))
 
 (defn individual-behavior-key
-  "Stable key from rounded model outputs on [[build-behavior-probes]]; nil if invalid or eval fails — use genome key then."
-  [ind {:keys [differential analytical]}]
+  "Stable key from rounded model outputs on [[build-behavior-probes]]; nil if invalid or eval fails — use genome key then.
+   Does not call [[genome-valid?]] — compile/eval failures return nil (expensive IC check skipped)."
+  [ind {:keys [differential analytical conserved]}]
   (try
-    (when (genome-valid? ind)
-      (case (:strategy ind)
-        :differential
-        (when (seq differential)
-          (let [dqx (compile-rate-fn (:dqx-expr ind))
-                dqy (compile-rate-fn (:dqy-expr ind))
-                dpx (compile-rate-fn (:dpx-expr ind))
-                dpy (compile-rate-fn (:dpy-expr ind))]
-            [:differential
-             (vec
-              (for [{:keys [qx qy px py m alpha]} differential]
-                [(quant-double (double (dqx qx qy px py m alpha)))
-                 (quant-double (double (dqy qx qy px py m alpha)))
-                 (quant-double (double (dpx qx qy px py m alpha)))
-                 (quant-double (double (dpy qx qy px py m alpha)))]))]))
-        :analytical
-        (when (seq analytical)
-          (let [qx-fn (compile-state-fn (:qx-expr ind))
-                qy-fn (compile-state-fn (:qy-expr ind))
-                px-fn (compile-state-fn (:px-expr ind))
-                py-fn (compile-state-fn (:py-expr ind))]
-            [:analytical
-             (vec
-              (for [{:keys [t q0x q0y p0x p0y m alpha]} analytical]
-                [(quant-double (safe-double (qx-fn t q0x q0y p0x p0y m alpha)))
-                 (quant-double (safe-double (qy-fn t q0x q0y p0x p0y m alpha)))
-                 (quant-double (safe-double (px-fn t q0x q0y p0x p0y m alpha)))
-                 (quant-double (safe-double (py-fn t q0x q0y p0x p0y m alpha)))]))]))
-        nil))
+    (case (:strategy ind)
+      :conserved
+      (when (seq conserved)
+        (let [c-fn (compile-conserved-fn (:c-expr ind))]
+          [:conserved
+           (vec (for [{:keys [qx qy px py m alpha]} conserved]
+                  (quant-double (safe-double (c-fn qx qy px py m alpha)))))]))
+      :differential
+      (when (seq differential)
+        (let [dqx (compile-rate-fn (:dqx-expr ind))
+              dqy (compile-rate-fn (:dqy-expr ind))
+              dpx (compile-rate-fn (:dpx-expr ind))
+              dpy (compile-rate-fn (:dpy-expr ind))]
+          [:differential
+           (vec
+            (for [{:keys [qx qy px py m alpha]} differential]
+              [(quant-double (double (dqx qx qy px py m alpha)))
+               (quant-double (double (dqy qx qy px py m alpha)))
+               (quant-double (double (dpx qx qy px py m alpha)))
+               (quant-double (double (dpy qx qy px py m alpha)))]))]))
+      :analytical
+      (when (seq analytical)
+        (let [qx-fn (compile-state-fn (:qx-expr ind))
+              qy-fn (compile-state-fn (:qy-expr ind))
+              px-fn (compile-state-fn (:px-expr ind))
+              py-fn (compile-state-fn (:py-expr ind))]
+          [:analytical
+           (vec
+            (for [{:keys [t q0x q0y p0x p0y m alpha]} analytical]
+              [(quant-double (safe-double (qx-fn t q0x q0y p0x p0y m alpha)))
+               (quant-double (safe-double (qy-fn t q0x q0y p0x p0y m alpha)))
+               (quant-double (safe-double (px-fn t q0x q0y p0x p0y m alpha)))
+               (quant-double (safe-double (py-fn t q0x q0y p0x p0y m alpha)))]))]))
+      nil)
     (catch Exception _ nil)))
 
+(defn- behavior-key-for
+  "Behavior or genome key; cache is a mutable Map reused within one generation."
+  [ind probes ^java.util.Map cache]
+  (let [gk (individual-genome-key ind)]
+    (if-some [hit (.get cache gk)]
+      hit
+      (let [k (or (individual-behavior-key ind probes) gk)]
+        (.put cache gk k)
+        k))))
+
 (defn take-distinct-by-behavior
-  "Keep top n ranked individuals with unique [[individual-behavior-key]] (fallback: genome key)."
-  [n ranked probes]
-  (loop [seen #{} out [] xs (seq ranked)]
-    (if (or (= (count out) n) (nil? xs))
-      out
-      (let [ind (first xs)
-            k (or (individual-behavior-key ind probes)
-                  (individual-genome-key ind))]
-        (if (contains? seen k)
-          (recur seen out (rest xs))
-          (recur (conj seen k) (conj out ind) (rest xs)))))))
+  "Keep top n ranked individuals with unique behavior key (fallback: genome key)."
+  [n ranked probes & [cache]]
+  (let [cache (or cache (behavior-key-cache))]
+    (loop [seen #{} out [] xs (seq ranked)]
+      (if (or (= (count out) n) (nil? xs))
+        out
+        (let [ind (first xs)
+              k   (behavior-key-for ind probes cache)]
+          (if (contains? seen k)
+            (recur seen out (rest xs))
+            (recur (conj seen k) (conj out ind) (rest xs))))))))
 
 (defn- evaluate-analytical-predictions [ind dataset]
   (let [fns {:qx (compile-state-fn (:qx-expr ind))
@@ -731,28 +849,33 @@
          :mse-q (/ sq-q n) :mse-p (/ sq-p n) :mse (/ (+ sq-q sq-p) n)}))))
 
 (defn- evaluate-conserved-predictions
-  "Metrics for a conserved-quantity individual: CoV = std/|mean| along trajectory."
+  "Metrics for a conserved-quantity individual.
+   :mse = max(squared CoV, squared relative RMS of |∇C·f|/|C|) — fails if either
+   constancy or the conservation law is violated."
   [ind dataset]
   (try
     (let [c-fn  (compile-conserved-fn (:c-expr ind))
-          {:keys [data m alpha]} dataset
-          md    (double m)
-          ad    (double alpha)
-          vals  (mapv (fn [{:keys [qx qy px py]}]
-                        (safe-double (c-fn (double qx) (double qy)
-                                          (double px) (double py) md ad)))
-                      data)
-          fvals (filterv #(Double/isFinite %) vals)
-          n     (count fvals)]
+          c-vals (conserved-vals-for-dataset c-fn dataset)
+          d-vals (conserved-dot-vals-for-dataset c-fn dataset)
+          fvals  (filterv #(Double/isFinite %) c-vals)
+          n      (count fvals)]
       (if (< n 3)
         {:strategy :conserved :mse Double/POSITIVE_INFINITY :n-horizons 0}
         (let [mean     (/ (reduce + fvals) n)
-              variance (/ (reduce (fn [s v] (let [d (- v mean)] (+ s (* d d)))) 0.0 fvals) n)]
+              variance (/ (reduce (fn [s v] (let [d (- v mean)] (+ s (* d d)))) 0.0 fvals) n)
+              cov-sq   (if (< (Math/abs mean) 1e-8) Double/POSITIVE_INFINITY
+                         (/ variance (* mean mean)))
+              pairs    (filterv (fn [[c d]] (and (Double/isFinite c) (Double/isFinite d)))
+                              (map vector c-vals d-vals))
+              dot-sq   (if (empty? pairs) Double/POSITIVE_INFINITY
+                         (/ (reduce (fn [s [c d]]
+                                      (let [scale (max (Math/abs c) 1e-8)]
+                                        (+ s (* (/ d scale) (/ d scale)))))
+                                    0.0 pairs)
+                            (count pairs)))]
           {:strategy :conserved
            :n-horizons n
-           ;; mse here = squared CoV, for consistency with the display format
-           :mse (if (< (Math/abs mean) 1e-8) Double/POSITIVE_INFINITY
-                    (/ variance (* mean mean)))})))
+           :mse (max cov-sq dot-sq)})))
     (catch Exception _ {:strategy :conserved :mse Double/POSITIVE_INFINITY :n-horizons 0})))
 
 (defn evaluate-predictions
@@ -1007,18 +1130,50 @@
 ;; defined earlier in the file so genome-valid? and evaluate-predictions
 ;; can reference them without forward declarations.
 
-(defn random-conserved-individual []
-  (loop [n 0]
-    (let [expr (random-expression 4 conserved-vars)
-          ind  {:strategy :conserved conserved-expr-key expr}]
-      (if (or (conserved-genome-valid? ind) (> n 200))
-        ind
-        (recur (inc n))))))
+(defn- conserved-syntax-valid?
+  "Cheap structural check — no per-scenario IC integration (used for escape immigrants)."
+  [ind]
+  (let [expr  (get ind conserved-expr-key)
+        sexpr (when (some? expr) (simplify-expr expr))]
+    (and (some? expr)
+         (not (number? sexpr))
+         (some #(expr-uses-symbol? sexpr %) state-vars)
+         (expr-uses-position? sexpr)
+         (some #(expr-uses-symbol? sexpr %) '[px py]))))
+
+(defn random-conserved-individual
+  ([] (random-conserved-individual {}))
+  ([{:keys [strict? max-tries] :or {strict? true max-tries 200}}]
+   (let [valid? (if strict? conserved-genome-valid? conserved-syntax-valid?)
+         max-tries (long max-tries)]
+     (loop [n 0]
+       (let [ind {:strategy :conserved
+                  conserved-expr-key (random-expression 4 conserved-vars)}]
+         (if (or (valid? ind) (>= n max-tries))
+           ind
+           (recur (inc n))))))))
+
+(def ^:private conserved-rel-scale 12000.0)
+
+(defn- fitness-from-relative-error
+  "Sharper reward for near-zero relative error. Spurious near-constants with CoV or
+   |∇C·f|/|C| ~0.01 score ~0.45; ~0.005 ~0.80; true invariants (≲1e-4) still ~1."
+  [rel-metric]
+  (/ 1.0 (+ 1.0 (* rel-metric rel-metric conserved-rel-scale))))
+
+(defn- conserved-complexity-factor
+  "Disfavor trig/sqrt trees — true Kepler invariants are compact algebra."
+  [expr]
+  (let [tree   (tree-seq sequential? seq (normalize-expr expr))
+        trig-n (count (filter #(and (sequential? %) (#{'e/sin 'e/cos} (first %))) tree))
+        sqrt-n (count (filter #(and (sequential? %) (= 'e/sqrt (first %))) tree))
+        penalty (+ (* trig-n 0.25) (* sqrt-n 0.15))]
+    (if (pos? penalty)
+      (/ 1.0 (+ 1.0 penalty))
+      1.0)))
 
 (defn- fitness-from-conserved
-  "fitness = 1 / (CoV + 1)  where CoV = std(C) / |mean(C)|.
-   Returns 0 if there are fewer than 3 finite values or the mean is near zero
-   (which would indicate a trivially-zero expression)."
+  "fitness from CoV = std(C) / |mean(C)| along one trajectory."
   [vals]
   (let [finite (filterv #(Double/isFinite %) vals)
         n      (count finite)]
@@ -1029,8 +1184,8 @@
             std      (Math/sqrt variance)
             abs-mean (Math/abs mean)]
         (if (< abs-mean 1e-8)
-          0.0  ; expression evaluates to ~0 on this trajectory — not a useful invariant
-          (/ 1.0 (+ (/ std abs-mean) 1.0)))))))
+          0.0
+          (fitness-from-relative-error (/ std abs-mean)))))))
 
 (defn- conserved-vals-for-dataset
   "Evaluate compiled conserved fn over every state in dataset; return vector of doubles."
@@ -1040,59 +1195,86 @@
             (safe-double (c-fn (double qx) (double qy) (double px) (double py) md ad)))
           data)))
 
+(def ^:private conserved-grad-eps 1e-6)
+
+(defn- conserved-dot-at-state
+  "Time derivative dC/dt = ∇C·f at one phase-space point, using central differences
+   for ∇C and the exact Hamiltonian vector field f = (q̇, ṗ)."
+  [c-fn qx qy px py m alpha]
+  (let [md (double m) ad (double alpha)
+        qx (double qx) qy (double qy) px (double px) py (double py)
+        eps conserved-grad-eps
+        c-at (fn [xq yq xp yp]
+               (safe-double (c-fn xq yq xp yp md ad)))
+        dc-dqx (/ (- (c-at (+ qx eps) qy px py) (c-at (- qx eps) qy px py)) (* 2.0 eps))
+        dc-dqy (/ (- (c-at qx (+ qy eps) px py) (c-at qx (- qy eps) px py)) (* 2.0 eps))
+        dc-dpx (/ (- (c-at qx qy (+ px eps) py) (c-at qx qy (- px eps) py)) (* 2.0 eps))
+        dc-dpy (/ (- (c-at qx qy px (+ py eps)) (c-at qx qy px (- py eps))) (* 2.0 eps))
+        {:keys [dqx dqy dpx dpy]} (grav2d-deriv md ad {:qx qx :qy qy :px px :py py})]
+    (+ (* dc-dqx dqx) (* dc-dqy dqy) (* dc-dpx dpx) (* dc-dpy dpy))))
+
+(defn- conserved-dot-vals-for-dataset
+  "Per-state |dC/dt| = |∇C·f| along a trajectory."
+  [c-fn {:keys [data m alpha]}]
+  (let [md (double m) ad (double alpha)]
+    (mapv (fn [{:keys [qx qy px py]}]
+            (let [dot (conserved-dot-at-state c-fn qx qy px py md ad)]
+              (if (Double/isFinite dot) (Math/abs dot) Double/NaN)))
+          data)))
+
+(defn- fitness-from-conservation-law
+  "fitness from RMS(|∇C·f| / |C|) — true invariants have ∇C·f = 0."
+  [c-vals dot-vals]
+  (let [pairs  (filterv (fn [[c d]] (and (Double/isFinite c) (Double/isFinite d)))
+                        (map vector c-vals dot-vals))
+        n      (count pairs)]
+    (if (< n 3)
+      0.0
+      (let [sq-rel (reduce (fn [s [c d]]
+                             (let [scale (max (Math/abs c) 1e-8)]
+                               (+ s (* (/ d scale) (/ d scale)))))
+                           0.0 pairs)
+            rms-rel (Math/sqrt (/ sq-rel n))]
+        (fitness-from-relative-error rms-rel)))))
+
+(defn- conserved-trajectory-fitness
+  "Combined per-trajectory fitness: must be both constant (low CoV) AND a true
+   invariant (∇C·f ≈ 0). Returns the minimum of the two component scores."
+  [c-fn dataset]
+  (let [c-vals (conserved-vals-for-dataset c-fn dataset)
+        d-vals (conserved-dot-vals-for-dataset c-fn dataset)]
+    (min (fitness-from-conserved c-vals)
+         (fitness-from-conservation-law c-vals d-vals))))
+
 (defn calculate-conserved-fitness
-  "Score a conserved-quantity individual on one trajectory dataset (per-trajectory CoV only).
-   Used internally; prefer calculate-conserved-fitness-scenarios for multi-dataset evaluation."
+  "Score a conserved-quantity individual on one trajectory dataset.
+   Requires low CoV along the orbit AND ∇C·f ≈ 0 (true invariant)."
   [ind dataset]
   (try
     (when (conserved-genome-valid? ind)
-      (fitness-from-conserved
-       (conserved-vals-for-dataset (compile-conserved-fn (:c-expr ind)) dataset)))
+      (conserved-trajectory-fitness (compile-conserved-fn (:c-expr ind)) dataset))
     (catch Exception _ 0)))
 
 (defn- calculate-conserved-fitness-scenarios
   "Full conserved-quantity fitness:
    1. Compile expression once.
-   2. Per-trajectory: CoV = std/|mean| must be low (expression is constant on each orbit).
-   3. IC-group check: means must differ across scenarios sharing the SAME (m, alpha).
-      This rejects expressions like 'alpha + c' that are parameter-only functions:
-      they pass the old CoV-across-all-scenarios check because alpha varies between
-      scenarios, but are constant within any iso-parameter group.
-   4. Global cross-scenario check as a secondary safety net.
-   Returns worst per-trajectory fitness after all checks pass."
+   2. Per-trajectory: low CoV AND |∇C·f| ≈ 0 (Poisson / Noether condition).
+   3. IC-group check on fixed reference scenarios (reject parameter-only hacks).
+   4. Global cross-scenario variation on the training/eval batch.
+   Returns worst per-trajectory combined fitness after all checks pass."
   [ind datasets]
   (try
     (when (conserved-genome-valid? ind)
       (let [c-fn  (compile-conserved-fn (:c-expr ind))
-            ;; Evaluate on each trajectory, collect finite values and per-traj mean.
             per-traj (mapv (fn [ds]
                              (let [vals   (conserved-vals-for-dataset c-fn ds)
                                    finite (filterv #(Double/isFinite %) vals)
                                    n      (count finite)
                                    mean   (when (>= n 1) (/ (reduce + finite) n))]
-                               {:vals finite :n n :mean mean :m (:m ds) :alpha (:alpha ds)}))
+                               {:vals finite :n n :mean mean :m (:m ds) :alpha (:alpha ds) :ds ds}))
                            datasets)
             traj-means (keep :mean per-traj)
-            ;; IC-group variation check: among scenarios that share (m, alpha), the
-            ;; expression's mean must differ noticeably (it must depend on ICs, not just params).
-            ;; Group by [m alpha] and check at least one group has CoV > 5% among its members.
-            ic-group-ok?
-            (let [groups (->> per-traj
-                              (group-by (fn [{:keys [m alpha]}]
-                                          [(double m) (double alpha)]))
-                              vals
-                              (filter #(>= (count %) 2)))]
-              (or (empty? groups)      ; only one scenario per param-combo → skip check
-                  (some (fn [grp]
-                          (let [ms (keep :mean grp)
-                                n  (count ms)]
-                            (when (>= n 2)
-                              (let [gm   (/ (reduce + ms) n)
-                                    gstd (Math/sqrt
-                                          (/ (reduce (fn [s v] (+ s (* (- v gm) (- v gm)))) 0.0 ms) n))]
-                                (> (/ gstd (max 1e-10 (Math/abs gm))) 0.05)))))
-                        groups)))
-            ;; Global cross-scenario check as secondary safety net.
+            ic-ok?   (ic-group-variation-ok? c-fn (scenarios->datasets default-scenarios))
             global-ok? (let [fmeans (filterv some? traj-means)
                              n      (count fmeans)]
                          (and (>= n 2)
@@ -1100,9 +1282,10 @@
                                     cstd (Math/sqrt
                                           (/ (reduce (fn [s v] (+ s (* (- v cm) (- v cm)))) 0.0 fmeans) n))]
                                 (> (/ cstd (max 1e-10 (Math/abs cm))) 0.05))))]
-        (if-not (and ic-group-ok? global-ok?)
+        (if-not (and ic-ok? global-ok?)
           0.0
-          (apply min (map #(fitness-from-conserved (:vals %)) per-traj)))))
+          (* (conserved-complexity-factor (:c-expr ind))
+             (apply min (map #(conserved-trajectory-fitness c-fn (:ds %)) per-traj))))))
     (catch Exception _ 0)))
 
 (def ^:dynamic *strategy-filter*
@@ -1110,16 +1293,24 @@
    generates only that strategy.  nil (default) = uniform mix of all three."
   nil)
 
+(def ^:dynamic *fast-immigrants?*
+  "When true, conserved immigrants skip expensive IC integration (fitness filters invalid)."
+  false)
+
 (defn random-individual []
   (case *strategy-filter*
     :analytical   (random-analytical-individual)
     :differential (random-differential-individual)
-    :conserved    (random-conserved-individual)
+    :conserved    (if *fast-immigrants?*
+                   (random-conserved-individual {:strict? false :max-tries 25})
+                   (random-conserved-individual))
     (let [r (rand)]
       (cond
         (< r 0.34) (random-analytical-individual)
         (< r 0.67) (random-differential-individual)
-        :else       (random-conserved-individual)))))
+        :else (if *fast-immigrants?*
+                (random-conserved-individual {:strict? false :max-tries 25})
+                (random-conserved-individual))))))
 
 ;; ── Physics seeds ─────────────────────────────────────────────────────────────
 ;; Hand-crafted individuals encoding known correct or near-correct physics.
@@ -1492,6 +1683,298 @@
           (cons op (mapv #(mutate % vars) (rest expr))))
         :else expr)))))
 
+;; ── Functional blocks (modular GP) ───────────────────────────────────────────
+;; Each expression slot decomposes into composable blocks (+/−/* terms or one subtree).
+;; Crossover swaps blocks between genomes — e.g. kinetic block + potential block → H.
+
+(defn- individual-expr-keys [ind]
+  (case (:strategy ind)
+    :analytical   analytical-expr-keys
+    :differential differential-expr-keys
+    :conserved    [conserved-expr-key]
+    []))
+
+(defn- decompose-expr-to-blocks
+  "Split an expression into a composable block representation."
+  [expr]
+  (let [e (normalize-expr expr)]
+    (cond
+      (not (sequential? e)) {:compose :mono :blocks [e]}
+      (= '+ (first e)) {:compose :+ :blocks (vec (rest e))}
+      (and (= '- (first e)) (= 1 (count (rest e))))
+      {:compose :neg :blocks [(second e)]}
+      (and (= '- (first e)) (>= (count (rest e)) 2))
+      {:compose :- :blocks [(second e) (nth e 2)]}
+      (= '* (first e)) {:compose :* :blocks (vec (rest e))}
+      :else {:compose :mono :blocks [e]})))
+
+(defn- compose-blocks-to-expr
+  [{:keys [compose blocks]}]
+  (let [blocks (vec blocks)]
+    (when (seq blocks)
+      (normalize-expr
+       (case compose
+         :mono (first blocks)
+         :neg  (list '- (first blocks))
+         :-   (list '- (first blocks) (second blocks))
+         :+    (apply list '+ blocks)
+         :*    (apply list '* blocks)
+         (first blocks))))))
+
+(def ^:private max-blocks-per-slot 6)
+
+(defn- attach-block-structure [ind]
+  (assoc ind :expr-blocks
+         (into {}
+               (for [k (individual-expr-keys ind)]
+                 [k (decompose-expr-to-blocks (get ind k))]))))
+
+(defn- materialize-exprs-from-blocks [ind]
+  (reduce (fn [acc [slot blks]]
+            (if-let [expr (compose-blocks-to-expr blks)]
+              (assoc acc slot expr)
+              acc))
+          ind
+          (:expr-blocks ind)))
+
+(defn sync-block-genome
+  "Keep :expr-blocks aligned with expression keys.
+   When :from-blocks? true, materialize expressions from blocks first (after crossover)."
+  [ind & {:keys [from-blocks?]}]
+  (if (and from-blocks? (:expr-blocks ind))
+    (-> ind materialize-exprs-from-blocks attach-block-structure)
+    (attach-block-structure ind)))
+
+(defn- block-crossover-blocks
+  "Graft block(s) from donor into recipient — no external catalog."
+  [recv donor]
+  (let [recv (update recv :blocks vec)
+        rb   (vec (:blocks recv))
+        db   (vec (:blocks donor))
+        graft (when (seq db) (rand-nth db))]
+    (if (nil? graft)
+      recv
+      (let [op (rand-nth [:replace :append :adopt-compose])]
+        (case op
+          :replace
+          (if (seq rb)
+            (assoc recv :blocks (assoc rb (rand-int (count rb)) graft))
+            {:compose :mono :blocks [graft]})
+
+          :append
+          (cond
+            (= :mono (:compose recv))
+            {:compose :+ :blocks [(first rb) graft]}
+            (and (= :+ (:compose recv)) (< (count rb) max-blocks-per-slot))
+            (update recv :blocks conj graft)
+            (seq rb)
+            (assoc recv :blocks (assoc rb (rand-int (count rb)) graft))
+            :else {:compose :mono :blocks [graft]})
+
+          :adopt-compose
+          (if (and (#{:+ :- :*} (:compose donor)) (seq db))
+            (assoc donor :blocks (vec (take max-blocks-per-slot db)))
+            recv))))))
+
+(defn- mutate-block-repr [block-repr vars]
+  (let [blocks (vec (:blocks block-repr))]
+    (if (empty? blocks)
+      block-repr
+      (let [i (rand-int (count blocks))]
+        (update block-repr :blocks assoc i (mutate (nth blocks i) vars))))))
+
+(defn- mutate-expr-via-blocks [expr vars _slot]
+  (-> expr
+      decompose-expr-to-blocks
+      (mutate-block-repr vars)
+      compose-blocks-to-expr))
+
+(defn individual-block-summary
+  "Block decomposition per slot (dev / REPL)."
+  [ind]
+  (let [ind (sync-block-genome ind)]
+    (into {} (for [k (individual-expr-keys ind)] [k (get-in ind [:expr-blocks k])]))))
+
+;; ── Symbolic block abstraction + hypothesis mutations ─────────────────────────
+;; Classify blocks by role (kinetic / potential / angular / junk) and apply
+;; structural edits using blocks already present in the genome — recompose,
+;; drop junk, swap in sibling blocks. No physics catalog or template injection.
+
+(def ^:dynamic *guess-mutations?* true)
+;; Set during long stagnation below target fitness — more random restarts, fewer clones.
+(def ^:dynamic *stagnation-escape?* false)
+
+(defn- expr-tree-size [expr]
+  (count (tree-seq sequential? seq (normalize-expr expr))))
+
+(defn- expr-uses-op? [expr op]
+  (cond
+    (= expr op) true
+    (coll? expr) (boolean (some #(expr-uses-op? % op) expr))
+    :else false))
+
+(defn- angular-like? [expr]
+  (let [s (normalize-expr (simplify-expr expr))]
+    (or (= s '(- (* qx py) (* qy px)))
+        (and (expr-uses-symbol? s 'qx) (expr-uses-symbol? s 'py)
+             (expr-uses-symbol? s 'qy) (expr-uses-symbol? s 'px)
+             (not (expr-uses-op? s 'e/sin))
+             (not (expr-uses-op? s 'e/cos))))))
+
+(defn- kinetic-like? [expr]
+  (and (expr-uses-symbol? expr 'm)
+       (or (expr-uses-symbol? expr 'px) (expr-uses-symbol? expr 'py))
+       (or (expr-uses-op? expr 'e/square)
+           (some #(and (sequential? %) (= 'e/square (first %)))
+                 (tree-seq sequential? seq expr)))))
+
+(defn- potential-like? [expr]
+  (and (expr-uses-symbol? expr 'alpha)
+       (expr-uses-position? expr)
+       (not (expr-uses-symbol? expr 'px))
+       (not (expr-uses-symbol? expr 'py))))
+
+(defn- block-junk-score [expr]
+  (+ (* 2.0 (count (filter #(and (sequential? %) (#{'e/sin 'e/cos} (first %)))
+                          (tree-seq sequential? seq expr))))
+     (* 1.0 (count (filter #(and (sequential? %) (= 'e/sqrt (first %)))
+                          (tree-seq sequential? seq expr))))
+     (if (and (expr-uses-symbol? expr 'm)
+              (> (expr-tree-size expr) 8)
+              (not (or (kinetic-like? expr) (potential-like? expr) (angular-like? expr))))
+       2.0
+       0.0)))
+
+(defn abstract-block
+  "Symbolic summary of one functional block (not a full seed — local classification)."
+  [expr]
+  (let [expr (normalize-expr expr)]
+    {:expr expr
+     :size (expr-tree-size expr)
+     :tags (motif-tags expr)
+     :kinetic? (kinetic-like? expr)
+     :potential? (potential-like? expr)
+     :angular? (angular-like? expr)
+     :trig? (or (expr-uses-op? expr 'e/sin) (expr-uses-op? expr 'e/cos))
+     :junk-score (block-junk-score expr)}))
+
+(defn abstract-slot-blocks
+  "Symbolic profile of all blocks in one expression slot."
+  [block-repr]
+  (let [blocks (mapv abstract-block (:blocks block-repr))]
+    {:compose (:compose block-repr)
+     :blocks blocks
+     :has-kinetic (some :kinetic? blocks)
+     :has-potential (some :potential? blocks)
+     :has-angular (some :angular? blocks)
+     :has-trig (some :trig? blocks)
+     :max-junk (if (seq blocks) (apply max (map :junk-score blocks)) 0.0)
+     :junkiest-idx (when (seq blocks)
+                     (first (apply max-key (fn [[_i b]] (:junk-score b))
+                                         (map-indexed vector blocks))))}))
+
+(defn block-abstraction-summary
+  "Per-slot symbolic block profiles for an individual (dev / REPL)."
+  [ind]
+  (let [ind (sync-block-genome ind)]
+    (into {}
+          (for [k (individual-expr-keys ind)]
+            [k (abstract-slot-blocks (get-in ind [:expr-blocks k]))]))))
+
+(defn- replace-block-at-index [block-repr idx new-expr]
+  (update block-repr :blocks assoc idx (normalize-expr new-expr)))
+
+(defn- drop-block-at-index [block-repr idx]
+  (let [nb (vec (concat (subvec (vec (:blocks block-repr)) 0 idx)
+                        (subvec (vec (:blocks block-repr)) (inc idx))))]
+    (when (seq nb)
+      (if (= 1 (count nb))
+        {:compose :mono :blocks nb}
+        (assoc block-repr :blocks nb)))))
+
+(defn- conserved-guess-candidates [block-repr]
+  (let [prof       (abstract-slot-blocks block-repr)
+        blocks     (:blocks prof)
+        k-expr     (some :expr (filter :kinetic? blocks))
+        p-expr     (some :expr (filter :potential? blocks))
+        good-exprs (mapv :expr (filter #(or (:kinetic? %) (:potential? %) (:angular? %)) blocks))
+        cands      (atom [])]
+    (when (and k-expr p-expr)
+      (swap! cands conj {:compose :- :blocks [k-expr p-expr]}))
+    (when (and (>= (count blocks) 2) (= :+ (:compose block-repr)))
+      (swap! cands conj (assoc block-repr :compose :-)))
+    (when (and (>= (count blocks) 2) (= :- (:compose block-repr)))
+      (swap! cands conj (assoc block-repr :compose :+)))
+    (when-let [ji (:junkiest-idx prof)]
+      (when-let [dropped (drop-block-at-index block-repr ji)]
+        (swap! cands conj dropped))
+      (doseq [g (distinct good-exprs)]
+        (swap! cands conj (replace-block-at-index block-repr ji g))))
+    (let [non-trig (vec (map :expr (filter #(not (:trig? %)) blocks)))]
+      (when (>= (count non-trig) 2)
+        (swap! cands conj {:compose :- :blocks [(first non-trig) (second non-trig)]})
+        (swap! cands conj {:compose :+ :blocks [(first non-trig) (second non-trig)]})))
+    (distinct (filter some? @cands))))
+
+(defn- differential-guess-candidates [block-repr]
+  (let [prof       (abstract-slot-blocks block-repr)
+        blocks     (:blocks prof)
+        good-exprs (mapv :expr (remove #(> (:junk-score %) 1.0) blocks))
+        cands      (atom [])]
+    (when (and (>= (count blocks) 2) (= :+ (:compose block-repr)))
+      (swap! cands conj (assoc block-repr :compose :-)))
+    (when-let [ji (:junkiest-idx prof)]
+      (when-let [dropped (drop-block-at-index block-repr ji)]
+        (swap! cands conj dropped))
+      (doseq [g (distinct good-exprs)]
+        (swap! cands conj (replace-block-at-index block-repr ji g))))
+    (distinct (filter some? @cands))))
+
+(defn- slot-guess-candidates [slot block-repr]
+  (case slot
+    :c-expr (conserved-guess-candidates block-repr)
+    (:dqx-expr :dqy-expr :dpx-expr :dpy-expr) (differential-guess-candidates block-repr)
+    []))
+
+(defn guess-mutate-individual
+  "Apply one symbolically guessed block edit (hypothesis mutation), not a random tree walk."
+  [ind]
+  (let [ind (sync-block-genome ind)
+        ks  (individual-expr-keys ind)]
+    (if (empty? ks)
+      ind
+      (let [slot (rand-nth ks)
+            blks (get-in ind [:expr-blocks slot])
+            cands (seq (slot-guess-candidates slot blks))]
+        (if cands
+          (let [full (filter #(#{:- :mono} (:compose %)) (vec cands))
+                pick (if (and (seq full) (< (rand) 0.55))
+                       (rand-nth full)
+                       (rand-nth cands))]
+            (sync-block-genome
+             (assoc-in ind [:expr-blocks slot] pick)
+             :from-blocks? true))
+          ind)))))
+
+(defn- random-block-mutate-individual [ind]
+  (let [ind (sync-block-genome ind)
+        mutate-one (fn [acc k vars]
+                     (if (< (rand) 0.7)
+                       (update-in acc [:expr-blocks k] mutate-block-repr vars)
+                       (assoc-in acc [:expr-blocks k]
+                                 (decompose-expr-to-blocks
+                                  (mutate (get acc k) vars)))))]
+    (sync-block-genome
+     (case (:strategy ind)
+       :analytical
+       (reduce #(mutate-one %1 %2 analytical-vars) ind analytical-expr-keys)
+       :differential
+       (reduce #(mutate-one %1 %2 differential-vars) ind differential-expr-keys)
+       :conserved
+       (mutate-one ind conserved-expr-key conserved-vars)
+       ind)
+     :from-blocks? true)))
+
 (defn- validate-and-repair
   "Simplify, detect degenerate (constant) sub-expressions, and ensure required
    symbols survive after mutation/crossover."
@@ -1514,31 +1997,25 @@
                        ind ks)
                ind)
         ;; 2. Re-inject any required symbols that were lost.
-        ind'' (case strategy
-                :analytical   (-> ind'
-                                  (ensure-symbol-coverage ks required-analytical-symbols)
-                                  ensure-analytical-uses-t)
-                :differential (ensure-symbol-coverage ind' ks required-differential-symbols)
-                :conserved    (if (conserved-genome-valid? ind')
-                                ind'
-                                (random-conserved-individual))
-                ind')]
+    ind'' (sync-block-genome
+           (case strategy
+             :analytical   (-> ind'
+                               (ensure-symbol-coverage ks required-analytical-symbols)
+                               ensure-analytical-uses-t)
+             :differential (ensure-symbol-coverage ind' ks required-differential-symbols)
+             :conserved    (if (conserved-genome-valid? ind')
+                             ind'
+                             (random-conserved-individual))
+             ind'))]
     ind''))
 
 (defn mutate-individual [ind]
-  (-> (if (< (rand) 0.2)
-        (random-individual)
-        (case (:strategy ind)
-          :analytical   (into {:strategy :analytical}
-                              (map (fn [k] [k (mutate (get ind k) analytical-vars)])
-                                   analytical-expr-keys))
-          :differential (into {:strategy :differential}
-                              (map (fn [k] [k (mutate (get ind k) differential-vars)])
-                                   differential-expr-keys))
-          :conserved    {:strategy :conserved
-                         conserved-expr-key (mutate (get ind conserved-expr-key) conserved-vars)}
-          (random-individual)))
-      validate-and-repair))
+  (let [restart-p (if *stagnation-escape?* 0.4 0.2)]
+    (-> (cond
+          (< (rand) restart-p) (random-individual)
+          (and *guess-mutations?* (< (rand) 0.45)) (guess-mutate-individual ind)
+          :else (random-block-mutate-individual ind))
+        validate-and-repair)))
 
 ;; ── Cross-pollination (GP crossover) ─────────────────────────────────────────
 
@@ -1570,42 +2047,46 @@
     (normalize-expr (splice-subtree recipient donor-sub 0.25))))
 
 (defn crossover-individuals
-  "Cross-pollinate two same-strategy individuals.
-   Each expression key is independently either:
-     - kept from parent A  (25%)
-     - taken whole from parent B  (25%)
-     - subtree-spliced A ← random subtree of B  (50%)
-   A light mutation pass is applied afterwards.
+  "Cross-pollinate two same-strategy individuals via functional blocks.
+   Each expression slot is independently either:
+     - kept from parent A           (20%)
+     - taken whole from parent B    (20%)
+     - block crossover A ← B        (45%)  — swap/append blocks from donor
+     - subtree splice (legacy GP)   (15%)
    Returns nil if strategies differ."
   [ind-a ind-b]
   (when (= (:strategy ind-a) (:strategy ind-b))
     (let [strategy (:strategy ind-a)
-          ks       (case strategy
-                     :analytical   analytical-expr-keys
-                     :differential differential-expr-keys
-                     :conserved    [conserved-expr-key]
-                     nil)
+          ind-a    (sync-block-genome ind-a)
+          ind-b    (sync-block-genome ind-b)
+          ks       (individual-expr-keys ind-a)
           vars     (case strategy
                      :analytical   analytical-vars
                      :differential differential-vars
                      :conserved    conserved-vars
                      nil)]
-      (when ks
-        (-> (into {:strategy strategy}
-                  (map (fn [k]
-                         (let [ea (get ind-a k) eb (get ind-b k)
-                               r  (rand)
-                               child (cond
-                                       (< r 0.25) ea
-                                       (< r 0.50) eb
-                                       :else      (crossover-expr ea eb))]
-                           [k (mutate child vars)]))
-                       ks))
-            validate-and-repair)))))
+      (when (seq ks)
+        (letfn [(cross-slot [k]
+                  (let [ba (get-in ind-a [:expr-blocks k])
+                        bb (get-in ind-b [:expr-blocks k])
+                        r  (rand)]
+                    (cond
+                      (< r 0.20) ba
+                      (< r 0.40) bb
+                      (< r 0.85) (block-crossover-blocks ba bb)
+                      :else (decompose-expr-to-blocks
+                              (crossover-expr (get ind-a k) (get ind-b k))))))]
+          (let [child-blocks (into {} (map (fn [k] [k (cross-slot k)]) ks))
+                child        (-> {:strategy strategy :expr-blocks child-blocks}
+                               (sync-block-genome :from-blocks? true))
+                mutated      (reduce (fn [acc k]
+                                       (update acc k #(mutate-expr-via-blocks % vars k)))
+                                     child ks)]
+            (validate-and-repair mutated)))))))
 
 
 (def default-population-file "data/population.edn")
-(def checkpoint-version 7)
+(def checkpoint-version 8)
 (def ^:private history-version 1)
 
 (defn history-path-for [population-path]
@@ -1646,12 +2127,16 @@
          :n      n}))))
 
 (defn- individual-for-save [ind]
-  (let [norm (fn [k] [k (normalize-expr (get ind k))])]
+  (let [ind  (sync-block-genome ind)
+        norm (fn [k] [k (normalize-expr (get ind k))])]
     (case (:strategy ind)
-      :analytical   (into {:strategy :analytical}   (map norm analytical-expr-keys))
-      :differential (into {:strategy :differential} (map norm differential-expr-keys))
-      :conserved    (into {:strategy :conserved}    [(norm conserved-expr-key)])
-      (into {:strategy (:strategy ind)}
+      :analytical   (into {:strategy :analytical :expr-blocks (:expr-blocks ind)}
+                          (map norm analytical-expr-keys))
+      :differential (into {:strategy :differential :expr-blocks (:expr-blocks ind)}
+                          (map norm differential-expr-keys))
+      :conserved    (into {:strategy :conserved :expr-blocks (:expr-blocks ind)}
+                          [(norm conserved-expr-key)])
+      (into {:strategy (:strategy ind) :expr-blocks (:expr-blocks ind)}
             (map norm (concat analytical-expr-keys differential-expr-keys))))))
 
 (defn save-population!
@@ -1673,8 +2158,8 @@
       (try
         (let [{:keys [version population generations-run population-size]}
               (edn/read-string (slurp path))]
-          (when (= version checkpoint-version)
-            {:population (vec population)
+          (when (contains? #{7 8} version)
+            {:population (mapv sync-block-genome population)
              :generations-run (long (or generations-run 0))
              :population-size population-size}))
         (catch Exception e
@@ -1745,6 +2230,7 @@
                :fitness-aggregate :min
                :fitness-percentile 10
                :scenario-seed nil
+               :guess-mutations? true
                :strategy nil}        ; nil = all strategies; or :analytical/:differential/:conserved
          xs args]
     (if (empty? xs)
@@ -1767,6 +2253,7 @@
           "--fitness-aggregate" (recur (assoc opts :fitness-aggregate (keyword (first more))) (rest more))
           "--fitness-percentile" (recur (assoc opts :fitness-percentile (Long/parseLong (first more))) (rest more))
           "--scenario-seed" (recur (assoc opts :scenario-seed (Long/parseLong (first more))) (rest more))
+          "--no-guess" (recur (assoc opts :guess-mutations? false) more)
           "--mcts-simulations" (recur (assoc opts :mcts-simulations (Long/parseLong (first more))) (rest more))
           "--mcts-inject" (recur (assoc opts :mcts-inject (Long/parseLong (first more))) (rest more))
           "--population" (recur (assoc opts :path (first more)) (rest more))
@@ -1775,26 +2262,42 @@
           "--strategy" (recur (assoc opts :strategy (keyword (first more))) (rest more))
           (throw (ex-info "Unknown argument"
                           {:arg a
-                           :hint "--fresh --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-mcts ..."})))))))
+                           :hint "--fresh --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-guess --no-mcts ..."})))))))
+
+(defn- distinct-elites
+  "Elite tier for one generation. During escape burst, collapse behaviorally identical clones."
+  [scored elite-cap probes behavior-diverse? cache]
+  (if behavior-diverse?
+    (take elite-cap (take-distinct-by-behavior (count scored) scored probes cache))
+    (take elite-cap (distinct scored))))
 
 (defn evolve-generation
   [population fitness-ctx population-size generation-index
-   & {:keys [extra-immigrants] :or {extra-immigrants 0}}]
+   & {:keys [extra-immigrants elite-divisor behavior-probes behavior-diverse-elites?
+             behavior-cache score-progress? gen-label]
+      :or {extra-immigrants 0 elite-divisor 5 behavior-diverse-elites? false
+           score-progress? false}}]
   (let [datasets    (datasets-for-fitness-context fitness-ctx :generation generation-index)
         fit-opts    (select-keys fitness-ctx [:aggregate :percentile])
+        cache       (or behavior-cache (behavior-key-cache))
+        n-pop       (count population)
         ;; 10% fresh random immigrants each generation (+ extras during stagnation).
         immigrant-n (+ (max 1 (quot population-size 10)) extra-immigrants)
-        elite-cap   (max 1 (quot population-size 5))
-        scored      (->> population
-                         (map (fn [ind]
-                                (assoc ind :fitness (calculate-fitness-scenarios
-                                                     ind datasets
-                                                     :aggregate (:aggregate fit-opts)
-                                                     :percentile (:percentile fit-opts)))))
-                         (sort-by :fitness #(compare %2 %1)))
-        ;; Deduplicate by genome before selecting elites so a clonal population
-        ;; can only contribute one elite slot, not all of them.
-        unique-elites (take elite-cap (distinct scored))
+        elite-cap   (max 1 (quot population-size elite-divisor))
+        scored      (vec
+                     (map-indexed
+                      (fn [i ind]
+                        (when (and score-progress? (zero? (mod i 10)))
+                          (do (println (format "    %s scoring %d/%d..."
+                                               (or gen-label "gen") (inc i) n-pop))
+                              (flush)))
+                        (assoc ind :fitness (calculate-fitness-scenarios
+                                             ind datasets
+                                             :aggregate (:aggregate fit-opts)
+                                             :percentile (:percentile fit-opts))))
+                      population))
+        scored      (sort-by :fitness #(compare %2 %1) scored)
+        unique-elites (distinct-elites scored elite-cap behavior-probes behavior-diverse-elites? cache)
         n-elites      (count unique-elites)
         breed-slots   (max 0 (- population-size immigrant-n))
         branch        (long (Math/ceil (/ breed-slots (double n-elites))))]
@@ -1817,7 +2320,8 @@
                                                 (mutate-individual parent))))))
                               unique-elites))
                 ;; Fresh random immigrants — guaranteed to appear every generation.
-                (repeatedly immigrant-n random-individual))))))
+                (binding [*fast-immigrants?* (or *fast-immigrants?* (> extra-immigrants 5))]
+                  (repeatedly immigrant-n random-individual)))))))
 
 (defn- prompt-continue-evolution? []
   (print "  Enter = next generation, q = stop and save: ")
@@ -1828,9 +2332,10 @@
   (timbre/merge-config! {:min-level :warn})
   (let [{:keys [fresh? seed? path generations population-size prompt-each-generation
                 fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile
-                strategy]}
+                strategy guess-mutations?]}
         (parse-args args)]
-  (binding [*strategy-filter* strategy]
+  (binding [*strategy-filter* strategy
+            *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)]
   (let [report-scenarios default-scenarios
         {:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
@@ -1852,7 +2357,7 @@
                             :population-size population-size))
         _ (do (save-checkpoint! initial generations-run)
               (println "checkpoint:" path
-                       (if resumed? "(resuming)" "(new run — use --fresh to ignore existing file)")))
+                       (if resumed? "(resuming)" "(new checkpoint file)")))
         ;; Fixed reference datasets used only for stable per-generation eval — never for selection.
         ref-datasets (scenarios->datasets default-scenarios)
         ;; Hall-of-fame: best individual ever seen by eval fitness. Injected every generation
@@ -1860,20 +2365,76 @@
         hall-of-fame  (atom nil)
         ;; Stagnation tracking: count consecutive gens without HoF improvement.
         stagnation    (atom 0)
-        stagnation-threshold 20   ; gens of flat HoF before doubling immigrants
+        escape-stagnation (atom 0) ; flat HoF while in [escape] burst mode
+        stagnation-threshold 20   ; gens of flat HoF before escape mode
+        stagnation-burst-threshold 50 ; gens before aggressive pool shake-up
+        escape-deep-threshold 25  ; [escape] gens without HoF gain → near-full reseed
+        hof-target 0.99
+        behavior-probes-lite (build-behavior-probes-lite ref-datasets)
         final-pop (reduce
                    (fn [pop gen-idx]
-                     ;; Inject the hall-of-fame individual into the pool before evolving so it
-                     ;; competes for elite slots on the new batch (replacing the last slot).
                      (let [prev-hof-fitness (or (:eval-fitness @hall-of-fame) 0.0)
                            stagnating?      (>= @stagnation stagnation-threshold)
-                           ;; During stagnation: double immigrants to boost diversity.
-                           extra-imm        (if stagnating? (quot population-size 10) 0)
-                           pop-with-hof     (if-let [hof @hall-of-fame]
-                                              (assoc (vec pop) (dec (count pop)) (:ind hof))
+                           suboptimal-hof?  (< prev-hof-fitness hof-target)
+                           escape?          (and stagnating? suboptimal-hof?)
+                           escape-burst?    (and escape? (>= @stagnation stagnation-burst-threshold))
+                           escape-deep?     (and escape-burst? (>= @escape-stagnation escape-deep-threshold))
+                           _ (when escape?
+                               (do (println (format "  gen %d/%d: evolving%s..."
+                                                    (inc gen-idx) generations
+                                                    (cond escape-deep? " [escape+]"
+                                                          escape-burst? " [escape]"
+                                                          :else " [stag]")))
+                                   (flush)))
+                           behavior-cache   (behavior-key-cache)
+                           extra-imm        (cond
+                                              escape-deep? (quot population-size 4)
+                                              escape-burst? (quot population-size 4)
+                                              escape? (quot population-size 4)
+                                              stagnating? (quot population-size 10)
+                                              :else 0)
+                           elite-divisor    (cond
+                                              escape-deep? 20
+                                              escape-burst? 10
+                                              :else 5)
+                           pop-with-hof     (if (and @hall-of-fame (not escape?))
+                                              (assoc (vec pop) (dec (count pop))
+                                                     (:ind @hall-of-fame))
                                               pop)
-                           pop' (evolve-generation pop-with-hof fitness-context population-size gen-idx
-                                                   :extra-immigrants extra-imm)
+                           hof-behavior     (when (and escape-burst? @hall-of-fame)
+                                              (behavior-key-for (:ind @hall-of-fame)
+                                                                behavior-probes-lite
+                                                                behavior-cache))
+                           pop-diverse      (binding [*fast-immigrants?* (or escape-burst? escape-deep?)]
+                                              (cond
+                                                escape-deep?
+                                                (vec (repeatedly population-size random-individual))
+
+                                                escape-burst?
+                                                (let [without-basin (if hof-behavior
+                                                                      (vec (remove #(= hof-behavior
+                                                                                       (behavior-key-for %
+                                                                                                          behavior-probes-lite
+                                                                                                          behavior-cache))
+                                                                                   pop-with-hof))
+                                                                      pop-with-hof)
+                                                      n-keep (max 0 (quot population-size 5))
+                                                      kept   (vec (take n-keep without-basin))
+                                                      n-fresh (min (- population-size (count kept))
+                                                                   (quot population-size 3))]
+                                                  (into kept (repeatedly n-fresh random-individual)))
+
+                                                :else pop-with-hof))
+                           pop' (binding [*stagnation-escape?* (or escape-burst? escape-deep?)
+                                          *fast-immigrants?* (or escape-burst? escape-deep?)]
+                                  (evolve-generation pop-diverse fitness-context population-size gen-idx
+                                                     :extra-immigrants extra-imm
+                                                     :elite-divisor elite-divisor
+                                                     :behavior-probes behavior-probes-lite
+                                                     :behavior-diverse-elites? escape-burst?
+                                                     :behavior-cache behavior-cache
+                                                     :score-progress? (or escape-burst? escape-deep?)
+                                                     :gen-label (format "gen %d" (inc gen-idx))))
                            gens (+ generations-run (inc gen-idx))
                            {:keys [best mean median]} (population-fitness-stats pop')
                            ;; Eval every elite individual on the fixed reference scenarios and
@@ -1895,8 +2456,11 @@
                                (reset! hall-of-fame {:ind best-eval-ind :eval-fitness eval-best}))
                            ;; Update stagnation counter.
                            _ (if (> (or (:eval-fitness @hall-of-fame) 0.0) prev-hof-fitness)
-                               (reset! stagnation 0)
-                               (swap! stagnation inc))]
+                               (do (reset! stagnation 0)
+                                   (reset! escape-stagnation 0))
+                               (do (swap! stagnation inc)
+                                   (when escape-burst?
+                                     (swap! escape-stagnation inc))))]
                        (save-checkpoint! pop' gens)
                        (swap! history conj {:gen (inc gen-idx) :total-gen gens
                                             :best best :mean mean :median median
@@ -1908,7 +2472,12 @@
                                         (or eval-best 0.0)
                                         (or (:eval-fitness @hall-of-fame) 0.0)
                                         mean
-                                        (if stagnating? (str "  [stag=" @stagnation "]") "")))
+                                        (str (when escape-deep? "  [escape+]")
+                                             (when (and escape-burst? (not escape-deep?)) "  [escape]")
+                                             (when (and escape? (not escape-burst?))
+                                               (str "  [stag=" @stagnation "]"))
+                                             (when (and stagnating? (not escape?))
+                                               (str "  [stag=" @stagnation "]")))))
                        (if (and prompt-each-generation
                                 (< gen-idx (dec generations))
                                 (not (prompt-continue-evolution?)))

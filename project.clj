@@ -13,5 +13,6 @@
   :target-path "target/%s"
   :aliases {"fitness-progress"  ["run" "-m" "clojure.main" "dev/fitness_progress.clj"]
             "top-expressions"   ["run" "-m" "clojure.main" "dev/top_expressions.clj"]
-            "debug-fit"         ["run" "-m" "clojure.main" "dev/debug_fit.clj"]}
+            "debug-fit"         ["run" "-m" "clojure.main" "dev/debug_fit.clj"]
+            "test-smoke"        ["test" ":only" "evophy.core-test/functional-blocks-smoke"]}
   :profiles {:uberjar {:aot [evophy.core]}})
