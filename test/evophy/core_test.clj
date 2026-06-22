@@ -183,13 +183,33 @@
 (deftest population-persistence-roundtrip
   (let [path (str (io/file (System/getProperty "java.io.tmpdir")
                            (str "evophy-pop-" (System/nanoTime) ".edn")))
-        pop [{:strategy :analytical
-              :qx-expr 'p0x :qy-expr 'p0y :px-expr 't :py-expr 't}
-             true-grav-rates]]
+        strip-blocks (fn [ind]
+                       (update ind :laws (fn [ls] (mapv #(dissoc % :expr-blocks) ls))))
+        pop [{:laws [{:kind :analytical
+                      :qx-expr 'p0x :qy-expr 'p0y :px-expr 't :py-expr 't}
+                     {:kind :differential
+                      :dqx-expr '(e/div px m)
+                      :dqy-expr '(e/div py m)
+                      :dpx-expr '(e/div (* -1.0 alpha) qx)
+                      :dpy-expr '(e/div (* -1.0 alpha) qy)}]}]]
     (try
-      (save-population! path pop :generations-run 12 :population-size 2)
+      (save-population! path pop :generations-run 12 :population-size 1)
       (is (= 12 (:generations-run (load-population path))))
-      (is (= pop (:population (load-population path))))
+      (is (= (strip-blocks (first pop))
+             (strip-blocks (first (:population (load-population path))))))
+      (finally
+        (.delete (io/file path))))))
+
+(deftest legacy-checkpoint-migrates-to-laws
+  (let [path (str (io/file (System/getProperty "java.io.tmpdir")
+                           (str "evophy-pop-" (System/nanoTime) ".edn")))
+        legacy {:version 8
+                :population-size 1
+                :generations-run 3
+                :population [{:strategy :conserved :c-expr '(+ px py)}]}]
+    (try
+      (spit path (pr-str legacy))
+      (is (= :conserved (first (individual-law-kinds (first (:population (load-population path)))))))
       (finally
         (.delete (io/file path))))))
 
@@ -230,12 +250,37 @@
 (deftest de-driven-conserved-hamiltonian-scores
   (let [ctx (make-fitness-context :evaluation :de-driven :phase-samples 32 :seed 1)
         ps  (phase-states-for-fitness-context ctx :generation 0)
+        ds  (scenarios->datasets default-scenarios)
         ham {:strategy :conserved
              :c-expr '(- (e/div (+ (* px px) (* py py)) (* 2.0 m)) (e/div alpha r))}
-        fit (calculate-fitness-scenarios ham nil
+        fit (calculate-fitness-scenarios ham ds
                                          :evaluation :de-driven
                                          :phase-states ps)]
     (is (pos? fit))))
+
+(deftest de-driven-conserved-hack-fails-orbit-constancy
+  (let [ctx (make-fitness-context :evaluation :de-driven :phase-samples 48 :seed 42)
+        ps  (phase-states-for-fitness-context ctx :generation 0)
+        ds  (scenarios->datasets default-scenarios)
+        ham {:strategy :conserved
+             :c-expr '(- (e/div (+ (* px px) (* py py)) (* 2.0 m)) (e/div alpha r))}
+        hack {:strategy :conserved
+              :c-expr '(- (+ m alpha)
+                          (e/div 0.03938900477260182
+                                 (e/div (+ 1.9739799029418634 py) qx)))}
+        h-fit (calculate-fitness-scenarios ham ds :evaluation :de-driven :phase-states ps)
+        k-fit (calculate-fitness-scenarios hack ds :evaluation :de-driven :phase-states ps)]
+    (is (pos? h-fit))
+    (is (< k-fit h-fit))
+    (is (< k-fit 0.1))))
+
+(deftest de-driven-composite-individual
+  (binding [*de-driven-search?* true
+            *strategy-filter* :conserved]
+    (let [ind (random-individual)
+          kinds (set (individual-law-kinds ind))]
+      (is (= 2 (count (individual-laws ind))))
+      (is (= #{:analytical :conserved} kinds)))))
 
 (deftest de-driven-analytical-taylor-beats-trig
   (let [ctx (make-fitness-context :evaluation :de-driven :phase-samples 32 :seed 2)
