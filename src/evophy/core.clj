@@ -349,10 +349,10 @@
 
   :mode — :random (default) or :fixed (uses [[default-scenarios]]); used when
   :evaluation is :data-driven.
-  :evaluation — :data-driven (trajectory fit) or :equation-driven (ODE / invariant
+  :evaluation — :data-driven (trajectory fit) or :de-driven (DE / invariant
   residual in phase space; analytical + conserved only — differential is redundant).
   :sample-count — random scenarios per evaluation batch (default 32).
-  :phase-samples — random phase-space points per batch when :equation-driven (48).
+  :phase-samples — random phase-space points per batch when :de-driven (48).
   :aggregate — :min (worst case) or :percentile.
   :percentile — fraction in [0,1] or whole percent e.g. 10 for 10th percentile (default 0.1).
   :seed — optional; with :generation offset, stabilizes per-generation batches across a run."
@@ -1296,7 +1296,7 @@
             (recur (inc attempt))))))))
 
 (defn phase-states-for-fitness-context
-  "Materialize phase-space sample points for one evaluation batch (:equation-driven)."
+  "Materialize phase-space sample points for one evaluation batch (:de-driven)."
   [ctx & {:keys [generation]}]
   (let [n (:phase-samples ctx 48)
         seed (when (:seed ctx) (+ (long (:seed ctx)) (long (or generation 0))))
@@ -1399,9 +1399,9 @@
                  law-fit))))))
     (catch Exception _ 0)))
 
-(defn- calculate-equation-driven-fitness
-  "Fitness from the governing ODE in the environment — not trajectory matching.
-   Differential rate laws score 0 (redundant with the known Hamiltonian)."
+(defn- calculate-de-driven-fitness
+  "Fitness from the environment DE — not trajectory matching.
+   Differential rate laws score 0 (redundant with the known equations of motion)."
   [ind phase-states]
   (case (:strategy ind)
     :analytical   (or (calculate-analytical-equation-fitness ind phase-states) 0.0)
@@ -1484,13 +1484,13 @@
   "When true, conserved immigrants skip expensive IC integration (fitness filters invalid)."
   false)
 
-(def ^:dynamic *equation-driven-search?*
+(def ^:dynamic *de-driven-search?*
   "When true, immigrants and default strategy mix exclude :differential (redundant with known ODE)."
   false)
 
 (defn random-individual []
   (cond
-    (and *equation-driven-search?* (nil? *strategy-filter*))
+    (and *de-driven-search?* (nil? *strategy-filter*))
     (if (< (rand) 0.5) (random-analytical-individual) (random-conserved-individual))
 
     *strategy-filter*
@@ -1736,7 +1736,7 @@
 (defn calculate-fitness-scenarios
   "Robust fitness over scenario datasets: :min (worst case) or :percentile (e.g. p10).
 
-  When :evaluation is :equation-driven, scores analytical/conserved genomes by ODE /
+  When :evaluation is :de-driven, scores analytical/conserved genomes by ODE /
   invariant residual on [[phase-states-for-fitness-context]]; differential always 0.
 
   For :conserved in :data-driven mode, uses a combined per-trajectory + cross-scenario check
@@ -1745,8 +1745,8 @@
   Optional :aggregate and :percentile (see [[aggregate-scenario-fitness]])."
   [individual datasets & {:keys [aggregate percentile evaluation phase-states]
                           :or {aggregate :min percentile 0.1 evaluation :data-driven}}]
-  (if (= (keyword evaluation) :equation-driven)
-    (or (calculate-equation-driven-fitness individual phase-states) 0.0)
+  (if (= (keyword evaluation) :de-driven)
+    (or (calculate-de-driven-fitness individual phase-states) 0.0)
     (if (= (:strategy individual) :conserved)
       (or (calculate-conserved-fitness-scenarios individual datasets) 0.0)
       (aggregate-scenario-fitness
@@ -2398,12 +2398,12 @@
     (into (subvec pop 0 (- n ns)) seeds)))
 
 (defn resolve-initial-population
-  [{:keys [fresh? seed? path population-size strategy equation-driven?]}]
+  [{:keys [fresh? seed? path population-size strategy de-driven?]}]
   (let [;; Filter seeds to the active strategy (nil = keep all).
         seeds (when seed?
                 (cond->> physics-seeds
                   strategy (filterv #(= (:strategy %) strategy))
-                  equation-driven? (remove #(= (:strategy %) :differential))))
+                  de-driven? (remove #(= (:strategy %) :differential))))
         base  (if fresh?
                 {:population (vec (repeatedly population-size random-individual))
                  :generations-run 0
@@ -2441,14 +2441,14 @@
                :fitness-percentile 10
                :scenario-seed nil
                :guess-mutations? true
-               :equation-driven? false
+               :de-driven? false
                :strategy nil}        ; nil = all strategies; or :analytical/:differential/:conserved
          xs args]
     (if (empty? xs)
       (assoc opts :fitness-context
              (make-fitness-context :mode (:fitness-mode opts)
-                                   :evaluation (if (:equation-driven? opts)
-                                                 :equation-driven
+                                   :evaluation (if (:de-driven? opts)
+                                                 :de-driven
                                                  :data-driven)
                                    :sample-count (:scenario-samples opts)
                                    :aggregate (:fitness-aggregate opts)
@@ -2467,7 +2467,7 @@
           "--fitness-aggregate" (recur (assoc opts :fitness-aggregate (keyword (first more))) (rest more))
           "--fitness-percentile" (recur (assoc opts :fitness-percentile (Long/parseLong (first more))) (rest more))
           "--scenario-seed" (recur (assoc opts :scenario-seed (Long/parseLong (first more))) (rest more))
-          "--equation-driven" (recur (assoc opts :equation-driven? true) more)
+          "--de-driven" (recur (assoc opts :de-driven? true) more)
           "--no-guess" (recur (assoc opts :guess-mutations? false) more)
           "--mcts-simulations" (recur (assoc opts :mcts-simulations (Long/parseLong (first more))) (rest more))
           "--mcts-inject" (recur (assoc opts :mcts-inject (Long/parseLong (first more))) (rest more))
@@ -2477,7 +2477,7 @@
           "--strategy" (recur (assoc opts :strategy (keyword (first more))) (rest more))
           (throw (ex-info "Unknown argument"
                           {:arg a
-                           :hint "--fresh --equation-driven --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-guess --no-mcts ..."})))))))
+                           :hint "--fresh --de-driven --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-guess --no-mcts ..."})))))))
 
 (defn- distinct-elites
   "Elite tier for one generation. During escape burst, collapse behaviorally identical clones."
@@ -2493,10 +2493,10 @@
       :or {extra-immigrants 0 elite-divisor 5 behavior-diverse-elites? false
            score-progress? false}}]
   (let [evaluation  (:evaluation fitness-ctx :data-driven)
-        equation-driven? (= evaluation :equation-driven)
-        datasets    (when-not equation-driven?
+        de-driven? (= evaluation :de-driven)
+        datasets    (when-not de-driven?
                       (datasets-for-fitness-context fitness-ctx :generation generation-index))
-        phase-states (when equation-driven?
+        phase-states (when de-driven?
                        (phase-states-for-fitness-context fitness-ctx
                                                          :generation generation-index))
         fit-opts    (select-keys fitness-ctx [:aggregate :percentile :evaluation])
@@ -2566,12 +2566,12 @@
                 fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile
                 strategy guess-mutations?]}
         (parse-args args)
-        equation-driven? (= :equation-driven (:evaluation fitness-context))]
+        de-driven? (= :de-driven (:evaluation fitness-context))]
   (binding [*strategy-filter* strategy
             *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)
-            *equation-driven-search?* equation-driven?]
-  (when (and equation-driven? (= strategy :differential))
-    (println "warning: --strategy differential with --equation-driven scores 0 (ODE is already known)"))
+            *de-driven-search?* de-driven?]
+  (when (and de-driven? (= strategy :differential))
+    (println "warning: --strategy differential with --de-driven scores 0 (DE is already known)"))
   (let [report-scenarios default-scenarios
         {:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
@@ -2579,10 +2579,10 @@
                                      :path path
                                      :population-size population-size
                                      :strategy strategy
-                                     :equation-driven? equation-driven?})
+                                     :de-driven? de-driven?})
         initial (normalize-population-size population population-size)
         fit-opts (select-keys fitness-context [:aggregate :percentile :evaluation])
-        eval-phase-states (when equation-driven?
+        eval-phase-states (when de-driven?
                             (phase-states-for-fitness-context
                              (assoc fitness-context :seed (or (:seed fitness-context) 42))
                              :generation 0))
@@ -2685,7 +2685,7 @@
                            elite-inds (filter :fitness pop')
                            eval-pairs (keep (fn [ind]
                                               (let [s (calculate-fitness-scenarios
-                                                       ind (when-not equation-driven? ref-datasets)
+                                                       ind (when-not de-driven? ref-datasets)
                                                        :aggregate (:aggregate fit-opts)
                                                        :percentile (:percentile fit-opts)
                                                        :evaluation (:evaluation fit-opts)
@@ -2731,13 +2731,13 @@
                    initial
                    (range generations))
         total-generations (:generations-run @checkpoint)
-        final-datasets (when-not equation-driven?
+        final-datasets (when-not de-driven?
                          (datasets-for-fitness-context fitness-context :generation generations))
         final-probes (build-behavior-probes (or final-datasets ref-datasets))
         ranked (->> final-pop
                     (map (fn [ind]
                            (assoc ind :fitness (calculate-fitness-scenarios
-                                                ind (when-not equation-driven? final-datasets)
+                                                ind (when-not de-driven? final-datasets)
                                                 :aggregate (:aggregate fit-opts)
                                                 :percentile (:percentile fit-opts)
                                                 :evaluation (:evaluation fit-opts)
@@ -2750,18 +2750,18 @@
     (println (if resumed? "resumed from" "finished; checkpoint") path)
     (println "total generations (cumulative):" total-generations)
     (println (str "fitness mode: " (name fitness-mode)
-                  (when equation-driven?
-                    " | evaluation: equation-driven (analytical ODE residual + conserved ∇C·f)")
-                  (when-not equation-driven?
+                  (when de-driven?
+                    " | evaluation: DE-driven (analytical ODE residual + conserved ∇C·f)")
+                  (when-not de-driven?
                     (str " | scenarios/gen: " (if (= fitness-mode :fixed)
                                                 (count default-scenarios)
                                                 scenario-samples)))
                   " | aggregate: " (name fitness-aggregate)
                   (when (= fitness-aggregate :percentile)
                     (str " | p" fitness-percentile))
-                  (when equation-driven?
+                  (when de-driven?
                     (str " | phase-samples/gen: " (:phase-samples fitness-context)))))
-    (when (and (not equation-driven?) (= fitness-mode :random))
+    (when (and (not de-driven?) (= fitness-mode :random))
       (println "  (new random scenario batch each generation; use --fixed-scenarios for the 5 named orbits)"))
     (when @stopped-early?
       (println "stopped early (q at prompt) — saved best-so-far population"))

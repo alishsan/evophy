@@ -220,25 +220,25 @@
          (some #(not= (:c-expr junk) (:c-expr %))
                (repeatedly 8 #(guess-mutate-individual junk)))))))
 
-(deftest equation-driven-differential-scores-zero
-  (let [ctx (make-fitness-context :evaluation :equation-driven :phase-samples 24)
+(deftest de-driven-differential-scores-zero
+  (let [ctx (make-fitness-context :evaluation :de-driven :phase-samples 24)
         ps  (phase-states-for-fitness-context ctx :generation 0)]
     (is (zero? (calculate-fitness-scenarios true-grav-rates nil
-                                              :evaluation :equation-driven
+                                              :evaluation :de-driven
                                               :phase-states ps)))))
 
-(deftest equation-driven-conserved-hamiltonian-scores
-  (let [ctx (make-fitness-context :evaluation :equation-driven :phase-samples 32 :seed 1)
+(deftest de-driven-conserved-hamiltonian-scores
+  (let [ctx (make-fitness-context :evaluation :de-driven :phase-samples 32 :seed 1)
         ps  (phase-states-for-fitness-context ctx :generation 0)
         ham {:strategy :conserved
              :c-expr '(- (e/div (+ (* px px) (* py py)) (* 2.0 m)) (e/div alpha r))}
         fit (calculate-fitness-scenarios ham nil
-                                         :evaluation :equation-driven
+                                         :evaluation :de-driven
                                          :phase-states ps)]
     (is (pos? fit))))
 
-(deftest equation-driven-analytical-taylor-beats-trig
-  (let [ctx (make-fitness-context :evaluation :equation-driven :phase-samples 32 :seed 2)
+(deftest de-driven-analytical-taylor-beats-trig
+  (let [ctx (make-fitness-context :evaluation :de-driven :phase-samples 32 :seed 2)
         ps  (phase-states-for-fitness-context ctx :generation 0)
         taylor {:strategy :analytical
                 :qx-expr '(+ q0x (* (e/div p0x m) t))
@@ -249,10 +249,10 @@
                :qx-expr '(e/sin t) :qy-expr '(e/sin t)
                :px-expr '(e/cos t) :py-expr '(e/cos t)}
         t-fit (calculate-fitness-scenarios taylor nil
-                                           :evaluation :equation-driven
+                                           :evaluation :de-driven
                                            :phase-states ps)
         c-fit (calculate-fitness-scenarios cheat nil
-                                           :evaluation :equation-driven
+                                           :evaluation :de-driven
                                            :phase-states ps)]
     (is (pos? t-fit))
     (is (>= t-fit c-fit))))
