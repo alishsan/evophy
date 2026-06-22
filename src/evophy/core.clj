@@ -281,6 +281,12 @@
   [scenarios]
   (mapv scenario-data scenarios))
 
+(defonce ^:private default-ref-datasets
+  (delay (scenarios->datasets default-scenarios)))
+
+(defn- reference-datasets []
+  @default-ref-datasets)
+
 (def default-scenario-bounds
   "Box in (m, α, q₀, p₀) for random scenario sampling; |q₀| ≥ :r-min.
    Wider ranges than before to include hyperbolic-energy scenarios in training."
@@ -341,24 +347,32 @@
 (defn make-fitness-context
   "Build a fitness evaluation context.
 
-  :mode — :random (default) or :fixed (uses [[default-scenarios]]).
+  :mode — :random (default) or :fixed (uses [[default-scenarios]]); used when
+  :evaluation is :data-driven.
+  :evaluation — :data-driven (trajectory fit) or :equation-driven (ODE / invariant
+  residual in phase space; analytical + conserved only — differential is redundant).
   :sample-count — random scenarios per evaluation batch (default 32).
-  :aggregate — :min (worst scenario) or :percentile.
+  :phase-samples — random phase-space points per batch when :equation-driven (48).
+  :aggregate — :min (worst case) or :percentile.
   :percentile — fraction in [0,1] or whole percent e.g. 10 for 10th percentile (default 0.1).
   :seed — optional; with :generation offset, stabilizes per-generation batches across a run."
-  [& {:keys [mode sample-count aggregate percentile seed]
+  [& {:keys [mode evaluation sample-count phase-samples aggregate percentile seed]
       :or {mode :random
+           evaluation :data-driven
            sample-count 32
+           phase-samples 48
            aggregate :min
            percentile 0.1}}]
   (let [pct (if (<= percentile 1) (double percentile) (/ (double percentile) 100.0))]
     {:mode (keyword mode)
+     :evaluation (keyword evaluation)
      :sample-count (long sample-count)
+     :phase-samples (long phase-samples)
      :aggregate (keyword aggregate)
      :percentile pct
      :seed (when seed (long seed))
      :datasets (when (= :fixed (keyword mode))
-                 (scenarios->datasets default-scenarios))}))
+                 (reference-datasets))}))
 
 (defn datasets-for-fitness-context
   "Materialize scenario datasets for one evaluation (one GP generation when :generation is set)."
@@ -653,7 +667,7 @@
          (try
            (ic-group-variation-ok?
             (compile-conserved-fn expr)
-            (scenarios->datasets default-scenarios))
+            (reference-datasets))
            (catch Exception _ false)))))
 
 (defn genome-valid?
@@ -687,6 +701,20 @@
                             (if (= n 1)
                               [0]
                               [0 1 (quot n 2) (dec n)]))))))
+
+(defn- fitness-subsample-indices [n max-points]
+  (cond
+    (zero? n) []
+    (<= n max-points) (vec (range n))
+    (= max-points 1) [0]
+    :else (vec (for [i (range max-points)]
+                 (int (/ (* i (dec n)) (dec max-points)))))))
+
+(defn- subsample-dataset
+  [{:keys [data] :as dataset} max-points]
+  (if (and max-points (pos? max-points) (> (count data) max-points))
+    (assoc dataset :data (mapv #(nth data %) (fitness-subsample-indices (count data) max-points)))
+    dataset))
 
 (defn- differential-probes-from-dataset [dataset]
   (let [{:keys [data m alpha]} dataset
@@ -1246,6 +1274,141 @@
     (min (fitness-from-conserved c-vals)
          (fitness-from-conservation-law c-vals d-vals))))
 
+(defn- random-phase-state
+  "One point in (qx, qy, px, py, m, α) inside [[default-scenario-bounds]]."
+  [& {:keys [bounds rng]}]
+  (let [bounds (or bounds default-scenario-bounds)
+        {:keys [m alpha q0x q0y p0x p0y r-min]} bounds
+        r-min (or r-min 1.0)]
+    (loop [attempt 0]
+      (let [qx (uniform-sample rng (first q0x) (second q0x))
+            qy (uniform-sample rng (first q0y) (second q0y))
+            r  (Math/sqrt (+ (* qx qx) (* qy qy)))]
+        (if (>= r r-min)
+          {:qx (double qx) :qy (double qy)
+           :px (uniform-sample rng (first p0x) (second p0x))
+           :py (uniform-sample rng (first p0y) (second p0y))
+           :m  (uniform-sample rng (first m) (second m))
+           :alpha (uniform-sample rng (first alpha) (second alpha))}
+          (if (> attempt 200)
+            (throw (ex-info "Could not sample valid phase state |q| >= r-min"
+                            {:bounds bounds :r-min r-min}))
+            (recur (inc attempt))))))))
+
+(defn phase-states-for-fitness-context
+  "Materialize phase-space sample points for one evaluation batch (:equation-driven)."
+  [ctx & {:keys [generation]}]
+  (let [n (:phase-samples ctx 48)
+        seed (when (:seed ctx) (+ (long (:seed ctx)) (long (or generation 0))))
+        rng  (when seed (java.util.Random. seed))]
+    (mapv (fn [_] (random-phase-state :rng rng)) (range n))))
+
+(def ^:private analytical-ode-check-times
+  "Short times after each IC for analytical ODE-residual probes."
+  [0.0 0.005 0.01 0.02 0.04])
+
+(defn- analytical-state-at
+  [fns t q0x q0y p0x p0y m alpha]
+  (let [td (double t) md (double m) ad (double alpha)
+        {qx-fn :qx qy-fn :qy px-fn :px py-fn :py} fns]
+    {:qx (safe-double (qx-fn td q0x q0y p0x p0y md ad))
+     :qy (safe-double (qy-fn td q0x q0y p0x p0y md ad))
+     :px (safe-double (px-fn td q0x q0y p0x p0y md ad))
+     :py (safe-double (py-fn td q0x q0y p0x p0y md ad))}))
+
+(defn- analytical-ode-residual-sq
+  "Squared ODE residual ‖(dq/dt, dp/dt)_num − f(q,p)‖² at one (IC, t) probe."
+  [fns {:keys [t q0x q0y p0x p0y m alpha]}]
+  (let [dt   1e-4
+        td   (double t)
+        md   (double m)
+        ad   (double alpha)
+        s    (analytical-state-at fns td q0x q0y p0x p0y md ad)
+        {:keys [qx qy px py]} s
+        deriv (grav2d-deriv md ad s)
+        [dqx-num dqy-num dpx-num dpy-num]
+        (if (< td (* 2.0 dt))
+          (let [s1 (analytical-state-at fns (+ td dt) q0x q0y p0x p0y md ad)]
+            [(/ (- (:qx s1) qx) dt)
+             (/ (- (:qy s1) qy) dt)
+             (/ (- (:px s1) px) dt)
+             (/ (- (:py s1) py) dt)])
+          (let [sm (analytical-state-at fns (- td dt) q0x q0y p0x p0y md ad)
+                sp (analytical-state-at fns (+ td dt) q0x q0y p0x p0y md ad)]
+            [(/ (- (:qx sp) (:qx sm)) (* 2.0 dt))
+             (/ (- (:qy sp) (:qy sm)) (* 2.0 dt))
+             (/ (- (:px sp) (:px sm)) (* 2.0 dt))
+             (/ (- (:py sp) (:py sm)) (* 2.0 dt))]))
+        D (max 1.0 (Math/sqrt (+ (* qx qx) (* qy qy))))
+        scale-p (max 1.0 (Math/sqrt (+ (* px px) (* py py))))]
+    (+ (e/square (/ (- dqx-num (:dqx deriv)) D))
+       (e/square (/ (- dqy-num (:dqy deriv)) D))
+       (e/square (/ (- dpx-num (:dpx deriv)) scale-p))
+       (e/square (/ (- dpy-num (:dpy deriv)) scale-p)))))
+
+(defn- fitness-from-mean-sq [mean-sq]
+  (if (or (not (Double/isFinite mean-sq)) (neg? mean-sq))
+    0.0
+    (/ 1.0 (+ 1.0 (Math/sqrt mean-sq)))))
+
+(defn- calculate-analytical-equation-fitness
+  "Score analytical trajectories by ODE residual d/dt q,p ≈ f(q,p) on random ICs."
+  [ind phase-states]
+  (try
+    (when (analytical-genome-valid? ind)
+      (let [fns {:qx (compile-state-fn (:qx-expr ind))
+                 :qy (compile-state-fn (:qy-expr ind))
+                 :px (compile-state-fn (:px-expr ind))
+                 :py (compile-state-fn (:py-expr ind))}
+            probes (vec (mapcat
+                         (fn [{:keys [qx qy px py m alpha]}]
+                           (map (fn [t]
+                                  {:t t :q0x qx :q0y qy :p0x px :p0y py :m m :alpha alpha})
+                                analytical-ode-check-times))
+                         phase-states))
+            sqs    (filterv #(and (Double/isFinite %) (not (Double/isNaN %)))
+                            (map #(analytical-ode-residual-sq fns %) probes))]
+        (when (seq sqs)
+          (fitness-from-mean-sq (/ (reduce + sqs) (count sqs))))))
+    (catch Exception _ 0)))
+
+(defn- calculate-conserved-equation-fitness
+  "Score conserved C by Poisson condition ∇C·f ≈ 0 at phase-space samples (true ODE in f)."
+  [ind phase-states]
+  (try
+    (when (conserved-genome-valid? ind)
+      (let [c-fn   (compile-conserved-fn (:c-expr ind))
+            c-vals (mapv (fn [{:keys [qx qy px py m alpha]}]
+                           (safe-double (c-fn (double qx) (double qy)
+                                              (double px) (double py)
+                                              (double m) (double alpha))))
+                         phase-states)
+            finite (filterv #(Double/isFinite %) c-vals)
+            n      (count finite)]
+        (when (>= n 3)
+          (let [mean   (/ (reduce + finite) n)
+                variance (/ (reduce (fn [s v] (let [d (- v mean)] (+ s (* d d)))) 0.0 finite) n)
+                cstd   (Math/sqrt variance)
+                cov-ok? (> (/ cstd (max 1e-10 (Math/abs mean))) 0.05)
+                dot-vals (mapv (fn [{:keys [qx qy px py m alpha]}]
+                                 (conserved-dot-at-state c-fn qx qy px py m alpha))
+                               phase-states)
+                law-fit (fitness-from-conservation-law c-vals dot-vals)]
+            (when (and cov-ok? (pos? law-fit))
+              (* (conserved-complexity-factor (:c-expr ind))
+                 law-fit))))))
+    (catch Exception _ 0)))
+
+(defn- calculate-equation-driven-fitness
+  "Fitness from the governing ODE in the environment — not trajectory matching.
+   Differential rate laws score 0 (redundant with the known Hamiltonian)."
+  [ind phase-states]
+  (case (:strategy ind)
+    :analytical   (or (calculate-analytical-equation-fitness ind phase-states) 0.0)
+    :conserved    (or (calculate-conserved-equation-fitness ind phase-states) 0.0)
+    :differential 0.0
+    0.0))
+
 (defn calculate-conserved-fitness
   "Score a conserved-quantity individual on one trajectory dataset.
    Requires low CoV along the orbit AND ∇C·f ≈ 0 (true invariant)."
@@ -1254,6 +1417,23 @@
     (when (conserved-genome-valid? ind)
       (conserved-trajectory-fitness (compile-conserved-fn (:c-expr ind)) dataset))
     (catch Exception _ 0)))
+
+(def ^:dynamic *fast-conserved-fitness?* false)
+(def ^:dynamic *fast-differential-fitness?* false)
+(def ^:dynamic *fitness-max-states* nil)
+(def ^:dynamic *fitness-timeout-ms* nil)
+
+(defn- call-with-timeout [ms label f]
+  (if (and ms (pos? ms))
+    (let [fut (future (try (f) (catch Exception _ 0.0)))
+          res (deref fut ms ::timeout)]
+      (when (= res ::timeout)
+        (future-cancel fut true)
+        (println (str "    fitness TIMEOUT after " ms "ms"
+                      (when label (str " (" label ")"))))
+        (flush))
+      (if (= res ::timeout) 0.0 res))
+    (f)))
 
 (defn- calculate-conserved-fitness-scenarios
   "Full conserved-quantity fitness:
@@ -1264,8 +1444,13 @@
    Returns worst per-trajectory combined fitness after all checks pass."
   [ind datasets]
   (try
-    (when (conserved-genome-valid? ind)
+    (when (if *fast-conserved-fitness?*
+            (conserved-syntax-valid? ind)
+            (conserved-genome-valid? ind))
       (let [c-fn  (compile-conserved-fn (:c-expr ind))
+            datasets (if-let [ms *fitness-max-states*]
+                       (mapv #(subsample-dataset % ms) datasets)
+                       datasets)
             per-traj (mapv (fn [ds]
                              (let [vals   (conserved-vals-for-dataset c-fn ds)
                                    finite (filterv #(Double/isFinite %) vals)
@@ -1274,7 +1459,9 @@
                                {:vals finite :n n :mean mean :m (:m ds) :alpha (:alpha ds) :ds ds}))
                            datasets)
             traj-means (keep :mean per-traj)
-            ic-ok?   (ic-group-variation-ok? c-fn (scenarios->datasets default-scenarios))
+            ic-ok?   (if *fast-conserved-fitness?*
+                       true
+                       (ic-group-variation-ok? c-fn (reference-datasets)))
             global-ok? (let [fmeans (filterv some? traj-means)
                              n      (count fmeans)]
                          (and (>= n 2)
@@ -1297,13 +1484,24 @@
   "When true, conserved immigrants skip expensive IC integration (fitness filters invalid)."
   false)
 
+(def ^:dynamic *equation-driven-search?*
+  "When true, immigrants and default strategy mix exclude :differential (redundant with known ODE)."
+  false)
+
 (defn random-individual []
-  (case *strategy-filter*
-    :analytical   (random-analytical-individual)
-    :differential (random-differential-individual)
-    :conserved    (if *fast-immigrants?*
-                   (random-conserved-individual {:strict? false :max-tries 25})
-                   (random-conserved-individual))
+  (cond
+    (and *equation-driven-search?* (nil? *strategy-filter*))
+    (if (< (rand) 0.5) (random-analytical-individual) (random-conserved-individual))
+
+    *strategy-filter*
+    (case *strategy-filter*
+      :analytical   (random-analytical-individual)
+      :differential (random-differential-individual)
+      :conserved    (if *fast-immigrants?*
+                      (random-conserved-individual {:strict? false :max-tries 25})
+                      (random-conserved-individual)))
+
+    :else
     (let [r (rand)]
       (cond
         (< r 0.34) (random-analytical-individual)
@@ -1498,11 +1696,16 @@
                  :dqy (compile-rate-fn (:dqy-expr ind))
                  :dpx (compile-rate-fn (:dpx-expr ind))
                  :dpy (compile-rate-fn (:dpy-expr ind))}
+            dataset (if-let [ms *fitness-max-states*]
+                      (subsample-dataset dataset ms)
+                      dataset)
             one-step (one-step-errors-differential fns dataset)
-            rollout  (rollout-errors-differential fns dataset)
-            errors   {:sq-q (+ (:sq-q one-step) (:sq-q rollout))
-                      :sq-p (+ (:sq-p one-step) (:sq-p rollout))
-                      :n    (+ (:n one-step)    (:n rollout))}]
+            errors   (if *fast-differential-fitness?*
+                       one-step
+                       (let [rollout (rollout-errors-differential fns dataset)]
+                         {:sq-q (+ (:sq-q one-step) (:sq-q rollout))
+                          :sq-p (+ (:sq-p one-step) (:sq-p rollout))
+                          :n    (+ (:n one-step)    (:n rollout))}))]
         (fitness-from-errors errors D)))
     (catch Exception _ 0)))
 
@@ -1533,17 +1736,23 @@
 (defn calculate-fitness-scenarios
   "Robust fitness over scenario datasets: :min (worst case) or :percentile (e.g. p10).
 
-  For :conserved individuals, uses a combined per-trajectory + cross-scenario check
+  When :evaluation is :equation-driven, scores analytical/conserved genomes by ODE /
+  invariant residual on [[phase-states-for-fitness-context]]; differential always 0.
+
+  For :conserved in :data-driven mode, uses a combined per-trajectory + cross-scenario check
   so trivially-constant expressions (e.g. cos(cos(qy/qy)) = const) score 0.
 
   Optional :aggregate and :percentile (see [[aggregate-scenario-fitness]])."
-  [individual datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
-  (if (= (:strategy individual) :conserved)
-    (or (calculate-conserved-fitness-scenarios individual datasets) 0.0)
-    (aggregate-scenario-fitness
-     (mapv #(calculate-fitness individual %) datasets)
-     :aggregate aggregate
-     :percentile percentile)))
+  [individual datasets & {:keys [aggregate percentile evaluation phase-states]
+                          :or {aggregate :min percentile 0.1 evaluation :data-driven}}]
+  (if (= (keyword evaluation) :equation-driven)
+    (or (calculate-equation-driven-fitness individual phase-states) 0.0)
+    (if (= (:strategy individual) :conserved)
+      (or (calculate-conserved-fitness-scenarios individual datasets) 0.0)
+      (aggregate-scenario-fitness
+       (mapv #(calculate-fitness individual %) datasets)
+       :aggregate aggregate
+       :percentile percentile))))
 
 (defn- expr-subtrees [expr]
   (let [expr (normalize-expr expr)]
@@ -2189,11 +2398,12 @@
     (into (subvec pop 0 (- n ns)) seeds)))
 
 (defn resolve-initial-population
-  [{:keys [fresh? seed? path population-size strategy]}]
+  [{:keys [fresh? seed? path population-size strategy equation-driven?]}]
   (let [;; Filter seeds to the active strategy (nil = keep all).
         seeds (when seed?
                 (cond->> physics-seeds
-                  strategy (filterv #(= (:strategy %) strategy))))
+                  strategy (filterv #(= (:strategy %) strategy))
+                  equation-driven? (remove #(= (:strategy %) :differential))))
         base  (if fresh?
                 {:population (vec (repeatedly population-size random-individual))
                  :generations-run 0
@@ -2231,11 +2441,15 @@
                :fitness-percentile 10
                :scenario-seed nil
                :guess-mutations? true
+               :equation-driven? false
                :strategy nil}        ; nil = all strategies; or :analytical/:differential/:conserved
          xs args]
     (if (empty? xs)
       (assoc opts :fitness-context
              (make-fitness-context :mode (:fitness-mode opts)
+                                   :evaluation (if (:equation-driven? opts)
+                                                 :equation-driven
+                                                 :data-driven)
                                    :sample-count (:scenario-samples opts)
                                    :aggregate (:fitness-aggregate opts)
                                    :percentile (:fitness-percentile opts)
@@ -2253,6 +2467,7 @@
           "--fitness-aggregate" (recur (assoc opts :fitness-aggregate (keyword (first more))) (rest more))
           "--fitness-percentile" (recur (assoc opts :fitness-percentile (Long/parseLong (first more))) (rest more))
           "--scenario-seed" (recur (assoc opts :scenario-seed (Long/parseLong (first more))) (rest more))
+          "--equation-driven" (recur (assoc opts :equation-driven? true) more)
           "--no-guess" (recur (assoc opts :guess-mutations? false) more)
           "--mcts-simulations" (recur (assoc opts :mcts-simulations (Long/parseLong (first more))) (rest more))
           "--mcts-inject" (recur (assoc opts :mcts-inject (Long/parseLong (first more))) (rest more))
@@ -2262,7 +2477,7 @@
           "--strategy" (recur (assoc opts :strategy (keyword (first more))) (rest more))
           (throw (ex-info "Unknown argument"
                           {:arg a
-                           :hint "--fresh --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-guess --no-mcts ..."})))))))
+                           :hint "--fresh --equation-driven --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-guess --no-mcts ..."})))))))
 
 (defn- distinct-elites
   "Elite tier for one generation. During escape burst, collapse behaviorally identical clones."
@@ -2277,25 +2492,42 @@
              behavior-cache score-progress? gen-label]
       :or {extra-immigrants 0 elite-divisor 5 behavior-diverse-elites? false
            score-progress? false}}]
-  (let [datasets    (datasets-for-fitness-context fitness-ctx :generation generation-index)
-        fit-opts    (select-keys fitness-ctx [:aggregate :percentile])
+  (let [evaluation  (:evaluation fitness-ctx :data-driven)
+        equation-driven? (= evaluation :equation-driven)
+        datasets    (when-not equation-driven?
+                      (datasets-for-fitness-context fitness-ctx :generation generation-index))
+        phase-states (when equation-driven?
+                       (phase-states-for-fitness-context fitness-ctx
+                                                         :generation generation-index))
+        fit-opts    (select-keys fitness-ctx [:aggregate :percentile :evaluation])
         cache       (or behavior-cache (behavior-key-cache))
         n-pop       (count population)
         ;; 10% fresh random immigrants each generation (+ extras during stagnation).
         immigrant-n (+ (max 1 (quot population-size 10)) extra-immigrants)
         elite-cap   (max 1 (quot population-size elite-divisor))
         scored      (vec
-                     (map-indexed
-                      (fn [i ind]
-                        (when (and score-progress? (zero? (mod i 10)))
-                          (do (println (format "    %s scoring %d/%d..."
-                                               (or gen-label "gen") (inc i) n-pop))
-                              (flush)))
-                        (assoc ind :fitness (calculate-fitness-scenarios
-                                             ind datasets
-                                             :aggregate (:aggregate fit-opts)
-                                             :percentile (:percentile fit-opts))))
-                      population))
+                     (binding [*fast-differential-fitness?* true
+                               *fast-conserved-fitness?* true
+                               *fitness-max-states* 64]
+                       (map-indexed
+                        (fn [i ind]
+                          (when score-progress?
+                            (do (println (format "    %s scoring %d/%d (%s)..."
+                                                 (or gen-label "gen") (inc i) n-pop
+                                                 (name (:strategy ind))))
+                                (flush)))
+                          (assoc ind :fitness
+                                 (or (call-with-timeout
+                                      (or *fitness-timeout-ms* 0)
+                                      (name (:strategy ind))
+                                      #(calculate-fitness-scenarios
+                                        ind datasets
+                                        :aggregate (:aggregate fit-opts)
+                                        :percentile (:percentile fit-opts)
+                                        :evaluation evaluation
+                                        :phase-states phase-states))
+                                     0.0)))
+                        population)))
         scored      (sort-by :fitness #(compare %2 %1) scored)
         unique-elites (distinct-elites scored elite-cap behavior-probes behavior-diverse-elites? cache)
         n-elites      (count unique-elites)
@@ -2333,18 +2565,27 @@
   (let [{:keys [fresh? seed? path generations population-size prompt-each-generation
                 fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile
                 strategy guess-mutations?]}
-        (parse-args args)]
+        (parse-args args)
+        equation-driven? (= :equation-driven (:evaluation fitness-context))]
   (binding [*strategy-filter* strategy
-            *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)]
+            *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)
+            *equation-driven-search?* equation-driven?]
+  (when (and equation-driven? (= strategy :differential))
+    (println "warning: --strategy differential with --equation-driven scores 0 (ODE is already known)"))
   (let [report-scenarios default-scenarios
         {:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
                                      :seed?  seed?
                                      :path path
                                      :population-size population-size
-                                     :strategy strategy})
+                                     :strategy strategy
+                                     :equation-driven? equation-driven?})
         initial (normalize-population-size population population-size)
-        fit-opts (select-keys fitness-context [:aggregate :percentile])
+        fit-opts (select-keys fitness-context [:aggregate :percentile :evaluation])
+        eval-phase-states (when equation-driven?
+                            (phase-states-for-fitness-context
+                             (assoc fitness-context :seed (or (:seed fitness-context) 42))
+                             :generation 0))
         stopped-early? (atom false)
         checkpoint (atom {:pop initial :generations-run generations-run})
         history-path (history-path-for path)
@@ -2426,7 +2667,9 @@
 
                                                 :else pop-with-hof))
                            pop' (binding [*stagnation-escape?* (or escape-burst? escape-deep?)
-                                          *fast-immigrants?* (or escape-burst? escape-deep?)]
+                                          *fast-immigrants?* (or escape-burst? escape-deep?)
+                                          *fitness-timeout-ms* (when (or escape-burst? escape-deep?)
+                                                                 180000)]
                                   (evolve-generation pop-diverse fitness-context population-size gen-idx
                                                      :extra-immigrants extra-imm
                                                      :elite-divisor elite-divisor
@@ -2442,9 +2685,11 @@
                            elite-inds (filter :fitness pop')
                            eval-pairs (keep (fn [ind]
                                               (let [s (calculate-fitness-scenarios
-                                                       ind ref-datasets
+                                                       ind (when-not equation-driven? ref-datasets)
                                                        :aggregate (:aggregate fit-opts)
-                                                       :percentile (:percentile fit-opts))]
+                                                       :percentile (:percentile fit-opts)
+                                                       :evaluation (:evaluation fit-opts)
+                                                       :phase-states eval-phase-states)]
                                                 (when (pos? s) [ind s])))
                                             elite-inds)
                            [best-eval-ind eval-best] (when (seq eval-pairs)
@@ -2486,13 +2731,17 @@
                    initial
                    (range generations))
         total-generations (:generations-run @checkpoint)
-        final-datasets (datasets-for-fitness-context fitness-context :generation generations)
-        final-probes (build-behavior-probes final-datasets)
+        final-datasets (when-not equation-driven?
+                         (datasets-for-fitness-context fitness-context :generation generations))
+        final-probes (build-behavior-probes (or final-datasets ref-datasets))
         ranked (->> final-pop
                     (map (fn [ind]
-                           (assoc ind :fitness (calculate-fitness-scenarios ind final-datasets
-                                                                          :aggregate (:aggregate fit-opts)
-                                                                          :percentile (:percentile fit-opts)))))
+                           (assoc ind :fitness (calculate-fitness-scenarios
+                                                ind (when-not equation-driven? final-datasets)
+                                                :aggregate (:aggregate fit-opts)
+                                                :percentile (:percentile fit-opts)
+                                                :evaluation (:evaluation fit-opts)
+                                                :phase-states eval-phase-states))))
                     (sort-by :fitness #(compare %2 %1))
                     vec)
         best (first ranked)
@@ -2501,13 +2750,18 @@
     (println (if resumed? "resumed from" "finished; checkpoint") path)
     (println "total generations (cumulative):" total-generations)
     (println (str "fitness mode: " (name fitness-mode)
-                  " | scenarios/gen: " (if (= fitness-mode :fixed)
-                                         (count default-scenarios)
-                                         scenario-samples)
+                  (when equation-driven?
+                    " | evaluation: equation-driven (analytical ODE residual + conserved ∇C·f)")
+                  (when-not equation-driven?
+                    (str " | scenarios/gen: " (if (= fitness-mode :fixed)
+                                                (count default-scenarios)
+                                                scenario-samples)))
                   " | aggregate: " (name fitness-aggregate)
                   (when (= fitness-aggregate :percentile)
-                    (str " | p" fitness-percentile))))
-    (when (= fitness-mode :random)
+                    (str " | p" fitness-percentile))
+                  (when equation-driven?
+                    (str " | phase-samples/gen: " (:phase-samples fitness-context)))))
+    (when (and (not equation-driven?) (= fitness-mode :random))
       (println "  (new random scenario batch each generation; use --fixed-scenarios for the 5 named orbits)"))
     (when @stopped-early?
       (println "stopped early (q at prompt) — saved best-so-far population"))
