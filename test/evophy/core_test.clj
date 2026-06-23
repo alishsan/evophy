@@ -285,7 +285,9 @@
 (deftest de-driven-analytical-taylor-beats-trig
   (let [ctx (make-fitness-context :evaluation :de-driven :phase-samples 32 :seed 2)
         ps  (phase-states-for-fitness-context ctx :generation 0)
+        ds  (scenarios->datasets default-scenarios)
         taylor {:strategy :analytical
+                :domain :bound
                 :qx-expr '(+ q0x (* (e/div p0x m) t))
                 :qy-expr '(+ q0y (* (e/div p0y m) t))
                 :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
@@ -293,11 +295,110 @@
         cheat {:strategy :analytical
                :qx-expr '(e/sin t) :qy-expr '(e/sin t)
                :px-expr '(e/cos t) :py-expr '(e/cos t)}
-        t-fit (calculate-fitness-scenarios taylor nil
+        t-fit (calculate-fitness-scenarios taylor ds
                                            :evaluation :de-driven
                                            :phase-states ps)
-        c-fit (calculate-fitness-scenarios cheat nil
+        c-fit (calculate-fitness-scenarios cheat ds
                                            :evaluation :de-driven
                                            :phase-states ps)]
     (is (pos? t-fit))
     (is (>= t-fit c-fit))))
+
+(deftest de-driven-analytical-junk-scores-low
+  (let [ds (scenarios->datasets default-scenarios)
+        taylor {:strategy :analytical
+                :domain :bound
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        junk {:strategy :analytical
+              :qx-expr '(+ (+ (+ (+ (e/square (e/div (* r06 r06) (e/cos r06))) (- t r05)) m) (+ (+ (e/square (e/div (* r06 r06) (e/cos r06))) (- t r05)) m)) (e/square (+ (+ (e/square (e/div (* r06 r06) (e/cos r06))) (- t (e/square (e/cos r05)))) m)))
+              :qy-expr '(+ t q0y)
+              :px-expr '(+ t (+ 0.5403023058681398 (+ (e/square (* r03 3.7292111344403054)) (e/square (* r03 3.2902258563907427)))))
+              :py-expr '(+ (+ (e/sin t) (- r06 -1.0)) q0x)}
+        t-fit (calculate-fitness-scenarios taylor ds :evaluation :de-driven)
+        j-fit (calculate-fitness-scenarios junk ds :evaluation :de-driven)]
+    (is (pos? t-fit))
+    (is (< j-fit t-fit))
+    (is (< j-fit 0.1))))
+
+(deftest de-driven-analytical-cartesian-fits-polar-orbit-in-cartesian-chart
+  (let [circle (scenario-data (first default-scenarios))
+        ds     [circle]
+        cart   {:strategy :analytical
+                :domain :bound
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}]
+    (is (pos? (calculate-fitness-scenarios cart ds :evaluation :de-driven)))))
+
+(deftest evaluate-predictions-survives-nonreal-intermediates
+  (let [ds (scenario-data (first default-scenarios))
+        junk {:strategy :analytical
+              :qx-expr '(+ q0x t)
+              :qy-expr '(+ t (* r0 omega-L))
+              :px-expr '(+ q0y m)
+              :py-expr '(+ t (e/sin (e/sqrt (e/cos r03))))}]
+    (is (map? (evaluate-predictions junk ds)))
+    (is (number? (:mse (evaluate-predictions junk ds))))))
+
+(deftest analytical-domain-skips-mismatched-scenarios
+  (let [circle (scenario-data (first default-scenarios))
+        hyper  (scenario-data (last default-scenarios))
+        taylor {:strategy :analytical :domain :bound
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        flyby  (assoc taylor :domain :unbound)]
+    (is (pos? (calculate-fitness-scenarios taylor [circle] :evaluation :de-driven)))
+    (is (zero? (calculate-fitness-scenarios taylor [hyper] :evaluation :de-driven)))
+    (is (pos? (calculate-fitness-scenarios flyby [hyper] :evaluation :de-driven)))
+    (let [m (evaluate-predictions taylor hyper)]
+      (is (:skipped? m))
+      (is (nil? (:mse m))))))
+
+(deftest analytical-if-energy-applies-to-both-regimes
+  (let [circle (scenario-data (first default-scenarios))
+        hyper  (scenario-data (last default-scenarios))
+        taylor {:strategy :analytical :domain :any
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        branch (fn [ex] (list 'e/if '(neg? energy) ex ex))
+        branched (into taylor
+                       (map (fn [[k ex]] [k (branch ex)])
+                            (select-keys taylor [:qx-expr :qy-expr :px-expr :py-expr])))]
+    (is (analytical-branches-on-energy? branched))
+    (is (domain-applicable? branched circle))
+    (is (domain-applicable? branched hyper))
+    (is (pos? (calculate-fitness-scenarios branched [circle] :evaluation :de-driven)))
+    (is (pos? (calculate-fitness-scenarios branched [hyper] :evaluation :de-driven)))
+    (is (not (:skipped? (evaluate-predictions branched hyper))))
+    (is (number? (:mse (evaluate-predictions branched hyper))))))
+
+(deftest both-regimes-scores-all-scenarios
+  (let [circle (scenario-data (first default-scenarios))
+        hyper  (scenario-data (last default-scenarios))
+        unbound-only {:strategy :analytical :domain :unbound
+                      :qx-expr '(+ q0x (* (e/div p0x m) t))
+                      :qy-expr '(+ q0y (* (e/div p0y m) t))
+                      :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                      :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        taylor {:strategy :analytical :domain :any
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        branch (fn [ex] (list 'e/if '(neg? energy) ex ex))
+        branched (into taylor
+                       (map (fn [[k ex]] [k (branch ex)])
+                            (select-keys taylor [:qx-expr :qy-expr :px-expr :py-expr])))]
+    (binding [*both-regimes?* true]
+      (is (domain-applicable? unbound-only circle))
+      (is (not (:skipped? (evaluate-predictions unbound-only circle))))
+      (is (pos? (calculate-fitness-scenarios branched [circle hyper]
+                                               :evaluation :de-driven))))))

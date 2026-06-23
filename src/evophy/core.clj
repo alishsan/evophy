@@ -10,6 +10,27 @@
 (defn- rewrite-div-in-expr [expr]
   (walk/postwalk #(if (= % 'e/div) 'e// %) expr))
 
+(defn- rewrite-real-ops-in-expr
+  "Replace Emmy ops with real-only helpers so sqrt/sin of invalid domains yield NaN, not Complex."
+  [expr]
+  (walk/postwalk
+   (fn [x]
+     (if (and (sequential? x) (seq x))
+       (let [[op & args] x]
+         (case op
+           e/sqrt   (list 'real-sqrt (first args))
+           e/sin    (list 'real-sin (first args))
+           e/cos    (list 'real-cos (first args))
+           e/square (list 'real-square (first args))
+           e/div    (list 'real-div (first args) (second args))
+           e//      (list 'real-div (first args) (second args))
+           e/if     (list 'if (first args)
+                           (list 'safe-double (second args))
+                           (list 'safe-double (nth args 2)))
+           x))
+       x))
+   expr))
+
 (defn- simplify-expr
   "Small algebraic simplifier to remove dead GP code before compile/score."
   [expr]
@@ -63,6 +84,9 @@
                       (= a b) 1              ; a/a → 1 (catches qy/qy, px/px, etc.)
                       (= b 1) a              ; a/1 → a
                       :else (list 'e/div a b)))
+                  e/if
+                  (let [[test then else] args]
+                    (list 'e/if (simp test) (simp then) (simp else)))
                   (cons op args)))
               x))]
     (let [match-cancel-mul (fn [x]
@@ -95,6 +119,33 @@
   (let [r (max (Math/sqrt (+ (* qx qx) (* qy qy))) 1e-12)]
     (+ (/ (+ (* px px) (* py py)) (* 2.0 m))
        (- (/ alpha r)))))
+
+(def analytical-domains
+  "Explicit validity of an analytical law: bound (E<0), unbound (E>0), or :any (legacy)."
+  #{:bound :unbound :any})
+
+(defn analytical-domain? [x]
+  (contains? analytical-domains (keyword x)))
+
+(defn scenario-regime
+  "Orbit class from total energy at t=0: :bound, :unbound, or :parabolic (E≈0)."
+  [{:keys [m alpha q0x q0y p0x p0y data]}]
+  (let [{:keys [qx qy px py]}
+        (if (seq data)
+          (let [{:keys [qx qy px py]} (first data)]
+            {:qx qx :qy qy :px px :py py})
+          {:qx q0x :qy q0y :px p0x :py p0y})
+        E (grav2d-energy m alpha {:qx qx :qy qy :px px :py py})]
+    (cond
+      (neg? (double E)) :bound
+      (pos? (double E)) :unbound
+      :else :parabolic)))
+
+(defn analytical-law-domain
+  "Domain tag on an analytical law; missing/invalid → :any (all scenarios)."
+  [law]
+  (let [d (:domain law)]
+    (if (analytical-domain? d) (keyword d) :any)))
 
 (defn- grav2d-deriv
   "Hamilton's equations: q̇ = ∂H/∂p, ṗ = −∂H/∂q."
@@ -244,8 +295,11 @@
    Each point also carries polar (r, θ, p_r, p_θ); :chart is the preferred coordinate chart."
   [scenario]
   (let [{:keys [m alpha q0x q0y p0x p0y dt steps]} scenario
-        dataset (assoc scenario :data (vec (generate-data m alpha q0x q0y p0x p0y dt steps)))]
-    (coords/enrich-dataset dataset)))
+        base  (assoc scenario :data (vec (generate-data m alpha q0x q0y p0x p0y dt steps)))
+        regime (scenario-regime base)]
+    (-> base
+        (coords/enrich-dataset)
+        (assoc :regime regime))))
 
 (defn- orbital-period
   "Keplerian period T = 2π √(m/α) · a^(3/2) for a bound orbit (E < 0).
@@ -352,8 +406,8 @@
 
   :mode — :random (default) or :fixed (uses [[default-scenarios]]); used when
   :evaluation is :data-driven.
-  :evaluation — :data-driven (trajectory fit) or :de-driven (analytical: ODE residual
-  vs the environment Hamiltonian; conserved: invariance along integrated orbits only —
+  :evaluation — :data-driven (trajectory fit) or :de-driven (analytical: short-horizon
+  trajectory fit on integrated orbits; conserved: invariance along integrated orbits only —
   conserved formulas are not DE solutions). Differential is redundant in :de-driven.
   :sample-count — random scenarios per evaluation batch (default 32).
   :phase-samples — random phase-space points per batch when :de-driven (48).
@@ -406,6 +460,76 @@
   ^double [v]
   (if (instance? Number v) (double v) Double/NaN))
 
+(defn- real-sqrt [a]
+  (let [x (safe-double a)]
+    (if (and (Double/isFinite x) (not (neg? x))) (Math/sqrt x) Double/NaN)))
+
+(defn- real-sin [a] (Math/sin (safe-double a)))
+
+(defn- real-cos [a] (Math/cos (safe-double a)))
+
+(defn- real-square [a]
+  (let [x (safe-double a)] (* x x)))
+
+(defn- real-div [a b]
+  (let [x (safe-double a)
+        y (safe-double b)]
+    (if (and (Double/isFinite x) (Double/isFinite y) (not (zero? y)))
+      (/ x y)
+      Double/NaN)))
+
+(defn- format-mse [mse]
+  (cond
+    (nil? mse) "n/a"
+    :else
+    (let [x (safe-double mse)]
+      (cond
+        (Double/isNaN x) "n/a"
+        (Double/isFinite x) (format "%.6f" x)
+        :else "Infinity"))))
+
+(def ^:private max-expr-tree-size 140)
+(def ^:private max-simplify-tree-size 80)
+
+(defn- expr-tree-size-fast
+  "Node count without normalize-expr; aborts early on pathological depth."
+  ([expr] (expr-tree-size-fast expr 0))
+  ([expr depth]
+   (cond
+     (> depth 48) (inc max-expr-tree-size)
+     (not (coll? expr)) 1
+     :else (+ 1 (reduce + 0 (map #(expr-tree-size-fast % (inc depth)) expr))))))
+
+(defn- expr-too-large? [expr]
+  (>= (expr-tree-size-fast expr) max-expr-tree-size))
+
+(defn- simplify-if-small [expr]
+  (if (>= (expr-tree-size-fast expr) max-simplify-tree-size)
+    expr
+    (simplify-expr expr)))
+
+(defn- prepare-expr-for-compile [expr]
+  (-> expr simplify-if-small rewrite-div-in-expr rewrite-real-ops-in-expr))
+
+(def ^:private ^java.util.concurrent.ConcurrentHashMap compile-fn-cache
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- compile-nan-fn
+  "Fallback when an expression is too large to compile safely."
+  [& _] Double/NaN)
+
+(defn- compile-cached
+  "Memoize eval-compiled fns; oversized trees compile to a constant NaN."
+  [kind expr body-fn]
+  (if (expr-too-large? expr)
+    compile-nan-fn
+    (let [key (str kind \space (pr-str expr))]
+      (if-some [hit (.get compile-fn-cache key)]
+        hit
+        (let [f (body-fn)]
+          (.put compile-fn-cache key f)
+          f)))))
+
 (defn- compile-state-fn [expr]
   ;; Derived variables from initial conditions:
   ;;   r0/r02/r03  — initial orbital radius and its powers
@@ -413,56 +537,75 @@
   ;;   omega-L     — true initial angular velocity L/(m·r₀²) = (q×p)/(m·r₀²); works for all orbits
   ;; Together these let the GP express Taylor corrections, circular rotation, and the
   ;; angular-momentum rotation approximation q(t) ≈ R(Ω_L·t)·q₀.
-  (binding [*ns* (the-ns 'evophy.core)]
-    (eval `(fn [~'t ~'q0x ~'q0y ~'p0x ~'p0y ~'m ~'alpha]
-             (let [~'r02    (+ (* ~'q0x ~'q0x) (* ~'q0y ~'q0y))
-                   ~'r0     (Math/sqrt (max ~'r02 1e-24))
-                   ~'r03    (* ~'r0 ~'r02)
-                   ~'r05    (* ~'r03 ~'r02)
-                   ~'r06    (* ~'r03 ~'r03)
-                   ~'omega  (Math/sqrt (max 0.0 (/ ~'alpha (* ~'m ~'r03))))
-                   ;; Angular velocity from the actual angular momentum L = q×p
-                   ~'omega-L (/ (- (* ~'q0x ~'p0y) (* ~'q0y ~'p0x))
-                                (* ~'m ~'r02))]
-               ~(-> expr simplify-expr rewrite-div-in-expr))))))
+  (compile-cached :state expr
+                  (fn []
+                    (binding [*ns* (the-ns 'evophy.core)]
+                      (eval `(fn [~'t ~'q0x ~'q0y ~'p0x ~'p0y ~'m ~'alpha]
+                               (let [~'r02    (+ (* ~'q0x ~'q0x) (* ~'q0y ~'q0y))
+                                     ~'r0     (Math/sqrt (max ~'r02 1e-24))
+                                     ~'r03    (* ~'r0 ~'r02)
+                                     ~'r05    (* ~'r03 ~'r02)
+                                     ~'r06    (* ~'r03 ~'r03)
+                                     ~'omega  (Math/sqrt (max 0.0 (/ ~'alpha (* ~'m ~'r03))))
+                                     ~'omega-L (/ (- (* ~'q0x ~'p0y) (* ~'q0y ~'p0x))
+                                                  (* ~'m ~'r02))
+                                     ~'energy (grav2d-energy ~'m ~'alpha {:qx ~'q0x :qy ~'q0y :px ~'p0x :py ~'p0y})]
+                                 (safe-double
+                                  ~(prepare-expr-for-compile expr)))))))))
 
 (defn- compile-rate-fn [expr]
-  (binding [*ns* (the-ns 'evophy.core)]
-    (eval `(fn [~'qx ~'qy ~'px ~'py ~'m ~'alpha]
-             (let [~'r2 (+ (* ~'qx ~'qx) (* ~'qy ~'qy))
-                   ~'r  (Math/sqrt (max ~'r2 1e-24))
-                   ~'r3 (* ~'r ~'r2)]
-               ~(-> expr simplify-expr rewrite-div-in-expr))))))
+  (compile-cached :rate expr
+                  (fn []
+                    (binding [*ns* (the-ns 'evophy.core)]
+                      (eval `(fn [~'qx ~'qy ~'px ~'py ~'m ~'alpha]
+                               (let [~'r2 (+ (* ~'qx ~'qx) (* ~'qy ~'qy))
+                                     ~'r  (Math/sqrt (max ~'r2 1e-24))
+                                     ~'r3 (* ~'r ~'r2)]
+                                 (safe-double
+                                  ~(prepare-expr-for-compile expr)))))))))
 
 (defn- compile-conserved-fn
   "Compile conserved-quantity expression to a fn [qx qy px py m alpha] -> double.
    Derives r, r2, r3 from position — identical binding to compile-rate-fn."
   [expr]
-  (binding [*ns* (the-ns 'evophy.core)]
-    (eval `(fn [~'qx ~'qy ~'px ~'py ~'m ~'alpha]
-             (let [~'r2 (+ (* ~'qx ~'qx) (* ~'qy ~'qy))
-                   ~'r  (Math/sqrt (max ~'r2 1e-24))
-                   ~'r3 (* ~'r ~'r2)]
-               ~(-> expr simplify-expr rewrite-div-in-expr))))))
+  (compile-cached :conserved expr
+                  (fn []
+                    (binding [*ns* (the-ns 'evophy.core)]
+                      (eval `(fn [~'qx ~'qy ~'px ~'py ~'m ~'alpha]
+                               (let [~'r2 (+ (* ~'qx ~'qx) (* ~'qy ~'qy))
+                                     ~'r  (Math/sqrt (max ~'r2 1e-24))
+                                     ~'r3 (* ~'r ~'r2)]
+                                 (safe-double
+                                  ~(prepare-expr-for-compile expr)))))))))
 
 (defn- compile-polar-state-fn [expr]
   "Analytical law in polar chart: (t, r₀, θ₀, p_r₀, p_θ₀, m, α) → scalar."
-  (binding [*ns* (the-ns 'evophy.core)]
-    (eval `(fn [~'t ~'r0 ~'theta0 ~'pr0 ~'ptheta0 ~'m ~'alpha]
-             (let [~'r02    (* ~'r0 ~'r0)
-                   ~'r03    (* ~'r02 ~'r0)
-                   ~'omega  (Math/sqrt (max 0.0 (/ ~'alpha (* ~'m ~'r03))))
-                   ~'omega-L (/ ~'ptheta0 (* ~'m ~'r02))]
-               ~(-> expr simplify-expr rewrite-div-in-expr))))))
+  (compile-cached :polar-state expr
+                  (fn []
+                    (binding [*ns* (the-ns 'evophy.core)]
+                      (eval `(fn [~'t ~'r0 ~'theta0 ~'pr0 ~'ptheta0 ~'m ~'alpha]
+                               (let [~'r02    (* ~'r0 ~'r0)
+                                     ~'r03    (* ~'r02 ~'r0)
+                                     ~'omega  (Math/sqrt (max 0.0 (/ ~'alpha (* ~'m ~'r03))))
+                                     ~'omega-L (/ ~'ptheta0 (* ~'m ~'r02))
+                                     ~'energy (+ (/ (+ (* ~'pr0 ~'pr0)
+                                                      (/ (* ~'ptheta0 ~'ptheta0) ~'r02))
+                                                  (* 2.0 ~'m))
+                                                 (- (/ ~'alpha ~'r0)))]
+                                 (safe-double
+                                  ~(prepare-expr-for-compile expr)))))))))
 
 (defn- compile-polar-conserved-fn [expr]
   "Conserved law in polar chart: C(r, θ, p_r, p_θ, m, α)."
   [expr]
-  (binding [*ns* (the-ns 'evophy.core)]
-    (eval `(fn [~'r ~'theta ~'pr ~'ptheta ~'m ~'alpha]
-             (let [~'r2 (* ~'r ~'r)
-                   ~'r3 (* ~'r ~'r2)]
-               ~(-> expr simplify-expr rewrite-div-in-expr))))))
+  (compile-cached :polar-conserved expr
+                  (fn []
+                    (binding [*ns* (the-ns 'evophy.core)]
+                      (eval `(fn [~'r ~'theta ~'pr ~'ptheta ~'m ~'alpha]
+                               (let [~'r2 (* ~'r ~'r)
+                                     ~'r3 (* ~'r ~'r2)]
+                                 (safe-double
+                                  ~(prepare-expr-for-compile expr)))))))))
 
 (defn- compile-conserved-fn-for-chart
   [chart expr]
@@ -643,11 +786,15 @@
   (or (:kind law) (:strategy law)))
 
 (defn- law-from-legacy [ind]
-  (-> ind (dissoc :strategy) (assoc :kind (:strategy ind))))
+  (cond-> (-> ind (dissoc :strategy) (assoc :kind (:strategy ind)))
+    (analytical-domain? (:domain ind))
+    (assoc :domain (keyword (:domain ind)))))
 
 (defn- law->legacy [law]
   (let [k (law-kind law)]
-    (-> law (assoc :strategy k) (dissoc :kind))))
+    (cond-> (-> law (assoc :strategy k) (dissoc :kind))
+      (and (= k :analytical) (not= (analytical-law-domain law) :any))
+      (assoc :domain (analytical-law-domain law)))))
 
 (defn individual-laws
   "All formula groups in an individual (legacy single-strategy maps become one law)."
@@ -667,9 +814,19 @@
   (> (count (individual-laws ind)) 1))
 
 (defn primary-strategy-label [ind]
-  (if (composite-individual? ind)
-    :composite
-    (law-kind (first (individual-laws ind)))))
+  (cond
+    (composite-individual? ind) :composite
+    :else (or (some law-kind (individual-laws ind)) :unknown)))
+
+(defn- first-law-legacy [ind]
+  (law->legacy (if (seq (:laws ind)) (first (:laws ind)) ind)))
+
+(defn- individual-with-law [ind law]
+  "Preserve :laws wrapper when mutating/crossing composite individuals."
+  (let [law (if (:kind law) law (law-from-legacy law))]
+    (if (seq (:laws ind))
+      (assoc ind :laws [law])
+      (law->legacy law))))
 
 (defn- strip-differential-laws [ind]
   (let [laws (vec (remove #(= :differential (law-kind %)) (individual-laws ind)))]
@@ -732,12 +889,73 @@
       (when (coords/analytical-exprs-present? law :cartesian) :cartesian)
       *preferred-law-chart*))
 
+(defn- expr-energy-regime-test? [expr]
+  (and (sequential? expr)
+       (= 'neg? (first expr))
+       (= 'energy (second expr))))
+
+(defn- expr-regime-branch? [expr]
+  (and (sequential? expr)
+       (= 'e/if (first expr))
+       (= 3 (count (rest expr)))
+       (expr-energy-regime-test? (second expr))))
+
+(defn analytical-branches-on-energy?
+  "True when any analytical slot uses (e/if (neg? energy) bound-branch unbound-branch)."
+  [law]
+  (let [leg   (if (:strategy law) law (law->legacy law))
+        chart (infer-law-chart leg)
+        keys  (coords/analytical-expr-keys-for-chart chart)]
+    (boolean (some #(when-let [ex (get leg %)] (expr-regime-branch? ex)) keys))))
+
+(def ^:private cartesian-analytical-expr-keys
+  [:qx-expr :qy-expr :px-expr :py-expr])
+
+(def ^:private unbound-linear-analytical-exprs
+  "First-order Taylor — default unbound arm when wrapping bound seeds for both-regimes."
+  '{:qx-expr (+ q0x (* (e/div p0x m) t))
+    :qy-expr (+ q0y (* (e/div p0y m) t))
+    :px-expr (+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+    :py-expr (+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))})
+
+(defn- wrap-analytical-energy-branches
+  "Each slot becomes (e/if (neg? energy) bound-expr unbound-expr)."
+  [ind & {:keys [unbound-exprs] :or {unbound-exprs unbound-linear-analytical-exprs}}]
+  (assoc (into ind
+               (map (fn [k]
+                      [k (list 'e/if '(neg? energy) (get ind k) (get unbound-exprs k))])
+                    cartesian-analytical-expr-keys))
+         :domain :any))
+
+(def ^:dynamic *both-regimes?*
+  "When true, analytical fitness/MSE use every scenario; genomes must branch on (neg? energy)."
+  false)
+
+(defn domain-applicable?
+  "True when an analytical law should be scored on this scenario/dataset.
+   Laws with (e/if (neg? energy) … …) apply to every scenario; :domain tags restrict.
+   With *both-regimes?*, every scenario applies (domain tags ignored)."
+  [law scenario-or-dataset]
+  (or *both-regimes?*
+      (analytical-branches-on-energy? law)
+      (let [ld (analytical-law-domain law)
+            sr (or (:regime scenario-or-dataset)
+                 (scenario-regime scenario-or-dataset))]
+        (or (= ld :any)
+            (= ld sr)
+            (and (= ld :unbound) (= sr :parabolic))))))
+
+(defn- datasets-for-analytical-law [law datasets]
+  (filterv #(domain-applicable? law %) datasets))
+
 (defn- analytical-genome-valid? [ind]
   (let [chart (infer-law-chart ind)
         keys  (coords/analytical-expr-keys-for-chart chart)
         required (coords/required-analytical-symbols-for-chart chart)]
     (and (every? #(expr-uses-t? (get ind %)) keys)
-         (symbols-covered-across-exprs? keys ind required))))
+         (symbols-covered-across-exprs? keys ind required)
+         (or (not *both-regimes?*)
+             (analytical-branches-on-energy? ind)))))
 
 (declare conserved-vals-for-dataset conserved-dot-vals-for-dataset)
 
@@ -1012,8 +1230,14 @@
             (recur seen out (rest xs))
             (recur (conj seen k) (conj out ind) (rest xs))))))))
 
+(defn- analytical-fitness-chart [ind _dataset]
+  (infer-law-chart ind))
+
 (defn- evaluate-analytical-predictions [ind dataset]
-  (let [chart (coords/effective-chart ind (:chart dataset))]
+  (if-not (domain-applicable? ind dataset)
+    {:strategy :analytical :n-horizons 0 :skipped? true
+     :mse-q nil :mse-p nil :mse nil}
+    (let [chart (analytical-fitness-chart ind dataset)]
     (if-not (coords/analytical-exprs-present? ind chart)
       {:strategy :analytical :n-horizons 0
        :mse-q Double/POSITIVE_INFINITY :mse-p Double/POSITIVE_INFINITY
@@ -1029,7 +1253,7 @@
            :mse Double/POSITIVE_INFINITY}
           (let [n (double n)]
             {:strategy :analytical :n-horizons (long n)
-             :mse-q (/ sq-q n) :mse-p (/ sq-p n) :mse (/ (+ sq-q sq-p) n)}))))))
+             :mse-q (/ sq-q n) :mse-p (/ sq-p n) :mse (/ (+ sq-q sq-p) n)})))))))
 
 (defn- evaluate-differential-predictions [ind dataset]
   (let [fns {:dqx (compile-rate-fn (:dqx-expr ind))
@@ -1058,7 +1282,7 @@
               c-fn   (compile-conserved-fn-for-chart chart (:c-expr ind))
               c-vals (conserved-vals-for-dataset c-fn ds)
               d-vals (conserved-dot-vals-for-dataset c-fn ds)
-              fvals  (filterv #(Double/isFinite %) c-vals)
+              fvals  (filterv #(Double/isFinite (safe-double %)) c-vals)
               n      (count fvals)]
           (if (< n 3)
             {:strategy :conserved :mse Double/POSITIVE_INFINITY :n-horizons 0}
@@ -1066,7 +1290,9 @@
                   variance (/ (reduce (fn [s v] (let [d (- v mean)] (+ s (* d d)))) 0.0 fvals) n)
                   cov-sq   (if (< (Math/abs mean) 1e-8) Double/POSITIVE_INFINITY
                              (/ variance (* mean mean)))
-                  pairs    (filterv (fn [[c d]] (and (Double/isFinite c) (Double/isFinite d)))
+                  pairs    (filterv (fn [[c d]]
+                                      (and (Double/isFinite (safe-double c))
+                                           (Double/isFinite (safe-double d))))
                                   (map vector c-vals d-vals))
                   dot-sq   (if (empty? pairs) Double/POSITIVE_INFINITY
                              (/ (reduce (fn [s [c d]]
@@ -1099,7 +1325,7 @@
     :else expr))
 
 (def ^:private latex-symbol-names
-  '{t "t" m "m" alpha "\\alpha"
+  '{t "t" m "m" alpha "\\alpha" energy "E"
     q0x "q_{0x}" q0y "q_{0y}" p0x "p_{0x}" p0y "p_{0y}"
     qx "q_x" qy "q_y" px "p_x" py "p_y"})
 
@@ -1159,6 +1385,13 @@
                   (if latex? (str "\\cos\\left(" a "\\right)") (str "cos(" a ")")))
           e/div (let [a (child (first args)) b (child (second args))]
                   (if latex? (str "\\frac{" a "}{" b "}") (str "(" a " / " b ")")))
+          e/if (let [[test then else] args
+                     t (child test) a (child then) b (child else)]
+                 (if latex?
+                   (str "\\begin{cases} " a " & E<0 \\\\ " b " & E\\geq 0 \\end{cases}")
+                   (str "if(" t "){" a "}{" b "}")))
+          neg? (let [a (child (first args))]
+                 (if latex? (str a " < 0") (str "neg?(" a ")")))
           (if latex?
             (str "\\mathrm{" (name op) "}\\left("
                  (clojure.string/join ", " (map child args)) "\\right)")
@@ -1265,12 +1498,13 @@
        :metrics metrics
        :sample sample})))
 
-(def ops '[+ - * e/square e/sin e/cos e/div e/sqrt])
+(def ops '[+ - * e/square e/sin e/cos e/div e/sqrt e/if])
 ;; Derived variables pre-computed by compile-state-fn from initial conditions.
 ;; r0/r02/r03/r05/r06 — initial radius powers (r₀¹,²,³,⁵,⁶)
 ;; omega             — circular angular velocity sqrt(α/m/r₀³); exact for circular orbit
 ;; omega-L           — actual initial angular velocity (q×p)/(m·r₀²); valid for any orbit
-(def analytical-derived-vars '[r0 r02 r03 r05 r06 omega omega-L])
+;; energy            — H(q₀,p₀); use with (e/if (neg? energy) bound-branch unbound-branch)
+(def analytical-derived-vars '[r0 r02 r03 r05 r06 omega omega-L energy])
 (def analytical-vars (vec (concat '[t] ic-vars param-vars analytical-derived-vars)))
 (def differential-vars (vec (concat state-vars param-vars derived-vars)))
 
@@ -1290,18 +1524,33 @@
   (rand-nth (concat vars constants)))
 
 (def unary-ops '#{e/square e/sin e/cos e/sqrt})
+(def ternary-ops '#{e/if})
 
 (defn random-expression
   ([depth] (random-expression depth analytical-vars))
   ([depth vars]
    (if (or (zero? depth) (< (rand) 0.3))
      (random-atom vars)
-     (let [op (rand-nth ops)]
-       (if (unary-ops op)
+     (let [allowed (if (>= depth 2) ops (vec (remove #{'e/if} ops)))
+           op (rand-nth allowed)]
+       (cond
+         (= op 'e/if)
+         (list 'e/if '(neg? energy)
+               (random-expression (dec depth) vars)
+               (random-expression (dec depth) vars))
+
+         (unary-ops op)
          (list op (random-expression (dec depth) vars))
+
+         :else
          (list op
                (random-expression (dec depth) vars)
                (random-expression (dec depth) vars)))))))
+
+(defn- random-regime-branch-expr [depth vars]
+  (list 'e/if '(neg? energy)
+        (random-expression depth vars)
+        (random-expression depth vars)))
 
 (defn- random-valid-individual [genome-fn expr-keys required-syms valid?-fn]
   (loop [n 0]
@@ -1309,7 +1558,11 @@
                   (ensure-symbol-coverage expr-keys required-syms))]
       (cond
         (valid?-fn ind) ind
-        (> n 500) ind
+        (> n 500) (if *both-regimes?*
+                    (wrap-analytical-energy-branches
+                     (into {:strategy :analytical :domain :any}
+                           unbound-linear-analytical-exprs))
+                    ind)
         :else (recur (inc n))))))
 
 (defn random-analytical-individual
@@ -1321,7 +1574,7 @@
                                (coords/ic-vars-for-chart chart)
                                param-vars
                                (if (= :polar chart)
-                                 '[r02 r03 omega omega-L]
+                                 '[r02 r03 omega omega-L energy]
                                  analytical-derived-vars)))
          required (coords/required-analytical-symbols-for-chart chart)
          ensure-t (fn [ind]
@@ -1331,8 +1584,14 @@
                                    [k (if (expr-uses-t? expr) expr (list '+ 't expr))]))
                                keys)))]
      (random-valid-individual
-      #(-> (into {:strategy :analytical}
-                 (map (fn [k] [k (random-expression 4 vars)]) keys))
+      #(-> (into {:strategy :analytical
+                  :domain (if *both-regimes?* :any
+                              (if (< (rand) 0.35) (rand-nth [:bound :unbound]) :any))}
+                 (map (fn [k]
+                        [k (if (or *both-regimes?* (< (rand) 0.22))
+                             (random-regime-branch-expr 3 vars)
+                             (random-expression 4 vars))])
+                      keys))
            (ensure-symbol-coverage keys required)
            (cond-> (= chart :cartesian) ensure-analytical-uses-t)
            (cond-> (= chart :polar) ensure-t))
@@ -1672,23 +1931,6 @@
   [ind _phase-states datasets]
   (or (calculate-conserved-trajectory-de-fitness ind datasets) 0.0))
 
-(defn- calculate-de-driven-fitness
-  "Fitness from the environment physics — not trajectory matching.
-   Analytical: ODE residual d/dt q,p ≈ f(q,p). Conserved: invariance along orbits only.
-   Differential rate laws score 0 (redundant with the known equations of motion)."
-  [ind phase-states datasets]
-  (case (:strategy ind)
-    :analytical
-    (let [scenario-chart (when (seq datasets) (coords/dominant-chart datasets))]
-      (if (and scenario-chart
-               (= :polar (coords/effective-chart ind scenario-chart))
-               (not (coords/analytical-exprs-present? ind :polar)))
-        0.0
-        (or (calculate-analytical-equation-fitness ind phase-states) 0.0)))
-    :conserved    (or (calculate-conserved-de-driven-fitness ind phase-states datasets) 0.0)
-    :differential 0.0
-    0.0))
-
 (defn- call-with-timeout [ms label f]
   (if (and ms (pos? ms))
     (let [fut (future (try (f) (catch Exception _ 0.0)))
@@ -1755,6 +1997,10 @@
 
 (def ^:dynamic *fast-immigrants?*
   "When true, conserved immigrants skip expensive IC integration (fitness filters invalid)."
+  false)
+
+(def ^:dynamic *fast-breeding?*
+  "When true, skip block decomposition / behavior dedup during breeding (escape mode)."
   false)
 
 (def ^:dynamic *de-driven-search?*
@@ -1841,6 +2087,7 @@
    ;; First-order: q(t) ≈ q₀ + (p₀/m)·t,  p(t) ≈ p₀ + F(q₀)·t
    ;; r0/r02/r03 are pre-computed by compile-state-fn from initial position.
    {:strategy :analytical
+    :domain :bound
     :qx-expr '(+ q0x (* (e/div p0x m) t))
     :qy-expr '(+ q0y (* (e/div p0y m) t))
     :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
@@ -1849,6 +2096,7 @@
    ;; Second-order: adds ½·F·t²/m correction to positions
    ;; q(t) ≈ q₀ + (p₀/m)t − (α·q₀)/(2m·r₀³)·t²
    {:strategy :analytical
+    :domain :bound
     :qx-expr '(+ q0x (+ (* (e/div p0x m) t) (* (e/div (* (* -0.5 alpha) q0x) (* m r03)) (* t t))))
     :qy-expr '(+ q0y (+ (* (e/div p0y m) t) (* (e/div (* (* -0.5 alpha) q0y) (* m r03)) (* t t))))
     :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
@@ -1858,6 +2106,7 @@
    ;; q(t) = R(ωt)·q₀  where ω = sqrt(α/(m·r₀³)), pre-computed as `omega`.
    ;; p(t) = m·ω·R(ωt+π/2)·q₀ = m·ω·(−sin,cos)·q₀
    {:strategy :analytical
+    :domain :bound
     :qx-expr '(- (* q0x (e/cos (* omega t))) (* q0y (e/sin (* omega t))))
     :qy-expr '(+ (* q0x (e/sin (* omega t))) (* q0y (e/cos (* omega t))))
     :px-expr '(* (* -1.0 (* m omega)) (+ (* q0x (e/sin (* omega t))) (* q0y (e/cos (* omega t)))))
@@ -1867,6 +2116,7 @@
    ;; where L = q₀×p₀ = q0x·p0y − q0y·p0x.  Better than circular-omega for eccentric orbits.
    ;; Momentum follows from d/dt of the rotated position.
    {:strategy :analytical
+    :domain :bound
     :qx-expr '(- (* q0x (e/cos (* omega-L t))) (* q0y (e/sin (* omega-L t))))
     :qy-expr '(+ (* q0x (e/sin (* omega-L t))) (* q0y (e/cos (* omega-L t))))
     :px-expr '(* (* -1.0 (* m omega-L)) (+ (* q0x (e/sin (* omega-L t))) (* q0y (e/cos (* omega-L t)))))
@@ -1877,6 +2127,7 @@
    ;; p(t) ≈ p₀ + F₀·t + ½·(dF/dt)|₀·t²
    ;; where dFx/dt|₀ = α·[(-1/r₀³ + 3q₀x²/r₀⁵)·p₀x + 3q₀x·q₀y·p₀y/r₀⁵] / m
    {:strategy :analytical
+    :domain :bound
     :qx-expr '(+ q0x (+ (* (e/div p0x m) t) (* (e/div (* (* -0.5 alpha) q0x) (* m r03)) (* t t))))
     :qy-expr '(+ q0y (+ (* (e/div p0y m) t) (* (e/div (* (* -0.5 alpha) q0y) (* m r03)) (* t t))))
     :px-expr '(+ p0x (+ (* (e/div (* (* -1.0 alpha) q0x) r03) t)
@@ -1899,6 +2150,7 @@
    ;; d³px/dt³|₀ ≈ α²·q₀x / (m·r₀⁶)   (circular-orbit approximation for the curvature term)
    ;; This fixes the remaining 16% error in px for the circle scenario.
    {:strategy :analytical
+    :domain :bound
     :qx-expr '(+ q0x (+ (* (e/div p0x m) t) (* (e/div (* (* -0.5 alpha) q0x) (* m r03)) (* t t))))
     :qy-expr '(+ q0y (+ (* (e/div p0y m) t) (* (e/div (* (* -0.5 alpha) q0y) (* m r03)) (* t t))))
     :px-expr '(+ p0x (+ (* (e/div (* (* -1.0 alpha) q0x) r03) t)
@@ -1918,6 +2170,22 @@
                            (* (e/div (* alpha (* alpha q0y)) (* 6.0 (* m r06)))
                               (* t (* t t))))))}
 
+   ;; Regime branching: Taylor on bound orbits, same linearization on unbound (no :domain tag).
+   {:strategy :analytical
+    :domain :any
+    :qx-expr '(e/if (neg? energy)
+                 (+ q0x (* (e/div p0x m) t))
+                 (+ q0x (* (e/div p0x m) t)))
+    :qy-expr '(e/if (neg? energy)
+                 (+ q0y (* (e/div p0y m) t))
+                 (+ q0y (* (e/div p0y m) t)))
+    :px-expr '(e/if (neg? energy)
+                 (+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                 (+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t)))
+    :py-expr '(e/if (neg? energy)
+                 (+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))
+                 (+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t)))}
+
    ;; ── Conserved quantity seeds ──────────────────────────────────────────
    ;; Angular momentum: L = qx·py − qy·px  (always conserved in central force)
    {:strategy :conserved
@@ -1929,9 +2197,16 @@
    {:strategy :conserved
     :c-expr '(e/div (+ (* px px) (* py py)) (* 2.0 m))}])
 
+(defn- both-regimes-analytical-seeds []
+  (mapv #(if (analytical-branches-on-energy? %)
+           %
+           (wrap-analytical-energy-branches %))
+        (filterv #(= (:strategy %) :analytical) physics-seeds)))
+
 (def de-driven-composite-seeds
   "Bundled analytical q(t),p(t) + Hamiltonian energy — one individual, two laws."
   [{:laws [{:kind :analytical
+            :domain :bound
             :r-expr '(+ r0 (* (e/div pr0 m) t))
             :theta-expr '(+ theta0 (* (e/div ptheta0 (* m r02)) t))
             :pr-expr '(+ pr0 (* (e/div (* (* -1.0 alpha) ptheta0 ptheta0) (* m r03 r02)) t))
@@ -1973,7 +2248,7 @@
   ;; We evaluate only the short-horizon portion where Taylor expansion approximations
   ;; (q ≈ q₀ + v₀t + ½·F·t², p ≈ p₀ + F·t) are achievable by GP.
   (try
-    (let [chart (coords/effective-chart ind (:chart dataset))]
+    (let [chart (analytical-fitness-chart ind dataset)]
       (if (and (analytical-genome-valid? ind)
                (coords/analytical-exprs-present? ind chart))
         (let [{:keys [data]} dataset
@@ -2035,25 +2310,57 @@
           (double (nth sorted idx)))
         (throw (ex-info "Unknown fitness aggregate" {:aggregate aggregate}))))))
 
+(defn- calculate-analytical-de-driven-fitness
+  "DE-driven analytical: short-horizon trajectory fit on integrated reference orbits
+   (same as data-driven analytical — not ODE residual on random phase probes)."
+  [ind datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
+  (try
+    (when (and (seq datasets) (analytical-genome-valid? ind))
+      (let [datasets (datasets-for-analytical-law ind datasets)
+            fits     (mapv (fn [ds] (calculate-analytical-fitness ind ds)) datasets)]
+        (if (seq datasets)
+          (aggregate-scenario-fitness fits :aggregate aggregate :percentile percentile)
+          0.0)))
+    (catch Exception _ nil)))
+
+(defn- calculate-de-driven-fitness
+  "Fitness from the environment physics — not naked trajectory matching in data-driven mode.
+   Analytical: short-horizon fit on integrated orbits. Conserved: invariance along orbits only.
+   Differential rate laws score 0 (redundant with the known equations of motion)."
+  [ind _phase-states datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
+  (case (:strategy ind)
+    :analytical   (or (calculate-analytical-de-driven-fitness ind datasets
+                                                               :aggregate aggregate
+                                                               :percentile percentile) 0.0)
+    :conserved    (or (calculate-conserved-de-driven-fitness ind nil datasets) 0.0)
+    :differential 0.0
+    0.0))
+
 (defn- calculate-single-fitness-scenarios
   "Fitness for one law (legacy single-strategy map)."
   [individual datasets & {:keys [aggregate percentile evaluation phase-states]
                           :or {aggregate :min percentile 0.1 evaluation :data-driven}}]
   (if (= (keyword evaluation) :de-driven)
-    (or (calculate-de-driven-fitness individual phase-states datasets) 0.0)
+    (or (calculate-de-driven-fitness individual phase-states datasets
+                                     :aggregate aggregate :percentile percentile) 0.0)
     (if (= (:strategy individual) :conserved)
       (or (calculate-conserved-fitness-scenarios individual datasets) 0.0)
-      (aggregate-scenario-fitness
-       (mapv #(calculate-fitness individual %) datasets)
-       :aggregate aggregate
-       :percentile percentile))))
+      (let [datasets (if (= (:strategy individual) :analytical)
+                       (datasets-for-analytical-law individual datasets)
+                       datasets)]
+        (if (empty? datasets)
+          0.0
+          (aggregate-scenario-fitness
+           (mapv #(calculate-fitness individual %) datasets)
+           :aggregate aggregate
+           :percentile percentile))))))
 
 (defn calculate-fitness-scenarios
   "Robust fitness over scenario datasets: :min (worst case) or :percentile (e.g. p10).
 
-  When :evaluation is :de-driven, scores analytical laws by ODE residual on phase
-  probes; conserved laws by invariance along reference trajectories only (not as DE
-  solutions). Differential always scores 0.
+  When :evaluation is :de-driven, scores analytical laws by short-horizon trajectory fit on
+  integrated reference orbits; conserved laws by invariance along those orbits only (not as
+  DE solutions). Differential always scores 0.
 
   Composite individuals (:laws with multiple entries) take the worst law fitness.
 
@@ -2532,23 +2839,26 @@
                     [nil nil])
         ind' (if ks
                (reduce (fn [acc k]
-                         (let [simplified (simplify-expr (get acc k))]
-                           (assoc acc k
-                                  (if (number? simplified)
-                                    (random-expression 3 vars)
-                                    simplified))))
+                         (let [raw (get acc k)
+                               expr (cond
+                                      (expr-too-large? raw) (random-expression 3 vars)
+                                      :else (let [s (simplify-if-small raw)]
+                                              (if (number? s)
+                                                (random-expression 3 vars)
+                                                s)))]
+                           (assoc acc k expr)))
                        ind ks)
                ind)
-        ind'' (sync-block-genome
-               (case strategy
-                 :analytical   (-> ind'
-                                   (ensure-symbol-coverage ks required-analytical-symbols)
-                                   ensure-analytical-uses-t)
-                 :differential (ensure-symbol-coverage ind' ks required-differential-symbols)
-                 :conserved    (if (conserved-genome-valid? ind')
-                                 ind'
-                                 (random-conserved-individual))
-                 ind'))]
+        repaired (case strategy
+                   :analytical   (-> ind'
+                                     (ensure-symbol-coverage ks required-analytical-symbols)
+                                     ensure-analytical-uses-t)
+                   :differential (ensure-symbol-coverage ind' ks required-differential-symbols)
+                   :conserved    (if (conserved-genome-valid? ind')
+                                   ind'
+                                   (random-conserved-individual))
+                   ind')
+        ind''  (if *fast-breeding?* repaired (sync-block-genome repaired))]
     ind''))
 
 (defn- validate-and-repair
@@ -2560,11 +2870,23 @@
                             (:laws ind)))
     (validate-and-repair-law ind)))
 
+(defn- mutate-analytical-domain [law]
+  (if (or *both-regimes?* (not= (law-kind law) :analytical))
+    law
+    (if (< (rand) 0.06)
+      (assoc law :domain (rand-nth [:bound :unbound]))
+      law)))
+
+(declare fast-mutate-law fast-crossover-single-laws)
+
 (defn- mutate-law [law]
-  (law-from-legacy
-   (if (and *guess-mutations?* (< (rand) 0.45))
-     (guess-mutate-individual (law->legacy law))
-     (random-block-mutate-individual (law->legacy law)))))
+  (mutate-analytical-domain
+   (law-from-legacy
+    (if *fast-breeding?*
+      (fast-mutate-law (law->legacy law))
+      (if (and *guess-mutations?* (< (rand) 0.45))
+        (guess-mutate-individual (law->legacy law))
+        (random-block-mutate-individual (law->legacy law)))))))
 
 (defn mutate-individual [ind]
   (let [restart-p (if *stagnation-escape?* 0.4 0.2)]
@@ -2574,6 +2896,7 @@
           (let [i (rand-int (count (:laws ind)))]
             (assoc ind :laws (assoc (vec (:laws ind)) i
                                     (mutate-law (nth (:laws ind) i)))))
+          *fast-breeding?* (individual-with-law ind (fast-mutate-law (first-law-legacy ind)))
           (and *guess-mutations?* (< (rand) 0.45)) (guess-mutate-individual ind)
           :else (random-block-mutate-individual ind))
         validate-and-repair)))
@@ -2603,9 +2926,37 @@
 (defn crossover-expr
   "GP subtree crossover: graft a random subtree of donor into a random position in recipient."
   [recipient donor]
-  (let [donor-nodes (filterv #(or (coll? %) (symbol? %)) (all-subtrees donor))
-        donor-sub   (rand-nth (if (seq donor-nodes) donor-nodes [donor]))]
-    (normalize-expr (splice-subtree recipient donor-sub 0.25))))
+  (if (or (expr-too-large? recipient) (expr-too-large? donor))
+    (normalize-expr recipient)
+    (let [donor-nodes (filterv #(or (coll? %) (symbol? %)) (all-subtrees donor))
+          donor-sub   (rand-nth (if (seq donor-nodes) donor-nodes [donor]))]
+      (normalize-expr (splice-subtree recipient donor-sub 0.25)))))
+
+(defn- fast-crossover-single-laws
+  "Light crossover during escape: per-slot parent pick, no block sync."
+  [ind-a ind-b]
+  (when (= (law-kind ind-a) (law-kind ind-b))
+    (let [strategy (law-kind ind-a)
+          ks       (individual-expr-keys ind-a)
+          domain   (when (and (= strategy :analytical) (not *both-regimes?*))
+                     (let [pick (analytical-law-domain (if (< (rand) 0.5) ind-a ind-b))]
+                       (if (= pick :any) (rand-nth [:bound :unbound]) pick)))]
+      (cond-> (into {:strategy strategy}
+                    (map (fn [k] [k (if (< (rand) 0.5) (get ind-a k) (get ind-b k))]) ks))
+        domain (assoc :domain domain)))))
+
+(defn- fast-mutate-law [law]
+  (let [leg      (if (:strategy law) law (law->legacy law))
+        strategy (law-kind leg)
+        [ks vars] (case strategy
+                    :analytical   [analytical-expr-keys analytical-vars]
+                    :differential [differential-expr-keys differential-vars]
+                    :conserved    [[conserved-expr-key] conserved-vars]
+                    [nil nil])]
+    (if (seq ks)
+      (let [k (rand-nth ks)]
+        (update leg k #(mutate % vars)))
+      leg)))
 
 (defn- crossover-single-laws
   "Cross-pollinate two same-strategy individuals via functional blocks.
@@ -2638,8 +2989,12 @@
                       :else (decompose-expr-to-blocks
                               (crossover-expr (get ind-a k) (get ind-b k))))))]
           (let [child-blocks (into {} (map (fn [k] [k (cross-slot k)]) ks))
-                child        (-> {:strategy strategy :expr-blocks child-blocks}
-                               (sync-block-genome :from-blocks? true))
+                domain     (when (and (= strategy :analytical) (not *both-regimes?*))
+                             (let [pick (analytical-law-domain (if (< (rand) 0.5) ind-a ind-b))]
+                               (if (= pick :any) (rand-nth [:bound :unbound]) pick)))
+                child        (cond-> {:strategy strategy :expr-blocks child-blocks}
+                               domain (assoc :domain domain))
+                child        (-> child (sync-block-genome :from-blocks? true))
                 mutated      (reduce (fn [acc k]
                                        (update acc k #(mutate-expr-via-blocks % vars k)))
                                      child ks)]
@@ -2648,20 +3003,36 @@
 (defn crossover-individuals
   "Cross-pollinate two individuals. Composite genomes cross law-by-law when kinds match."
   [ind-a ind-b]
-  (cond
-    (and (seq (:laws ind-a)) (seq (:laws ind-b)))
-    (when (= (individual-law-kinds ind-a) (individual-law-kinds ind-b))
-      (laws-individual
-       (mapv (fn [la lb]
-               (law-from-legacy (crossover-single-laws (law->legacy la) (law->legacy lb))))
-             (:laws ind-a) (:laws ind-b))))
+  (if *fast-breeding?*
+    (cond
+      (and (seq (:laws ind-a)) (seq (:laws ind-b)))
+      (when (= (individual-law-kinds ind-a) (individual-law-kinds ind-b))
+        (let [laws (filterv some?
+                          (mapv (fn [la lb]
+                                  (when-let [c (fast-crossover-single-laws (law->legacy la)
+                                                                            (law->legacy lb))]
+                                    (law-from-legacy c)))
+                                (:laws ind-a) (:laws ind-b)))]
+          (when (seq laws) (laws-individual laws))))
 
-    :else
-    (crossover-single-laws ind-a ind-b)))
+      :else
+      (when-let [child (fast-crossover-single-laws (first-law-legacy ind-a)
+                                                   (first-law-legacy ind-b))]
+        (individual-with-law ind-a child)))
+    (cond
+      (and (seq (:laws ind-a)) (seq (:laws ind-b)))
+      (when (= (individual-law-kinds ind-a) (individual-law-kinds ind-b))
+        (laws-individual
+         (mapv (fn [la lb]
+                 (law-from-legacy (crossover-single-laws (law->legacy la) (law->legacy lb))))
+               (:laws ind-a) (:laws ind-b))))
+
+      :else
+      (crossover-single-laws ind-a ind-b))))
 
 
 (def default-population-file "data/population.edn")
-(def checkpoint-version 9)
+(def checkpoint-version 10)
 (def ^:private history-version 1)
 
 (defn history-path-for [population-path]
@@ -2705,7 +3076,10 @@
   (let [leg  (sync-block-genome (law->legacy law))
         norm (fn [k] [k (normalize-expr (get leg k))])]
     (into (cond-> {:kind (law-kind leg) :expr-blocks (:expr-blocks leg)}
-            (coords/law-chart leg) (assoc :chart (coords/law-chart leg)))
+            (coords/law-chart leg) (assoc :chart (coords/law-chart leg))
+            (and (= (law-kind leg) :analytical)
+                 (not= (analytical-law-domain leg) :any))
+            (assoc :domain (analytical-law-domain leg)))
           (map norm (individual-expr-keys leg)))))
 
 (defn- individual-for-save [ind]
@@ -2730,7 +3104,7 @@
       (try
         (let [{:keys [version population generations-run population-size]}
               (edn/read-string (slurp path))]
-          (when (contains? #{7 8 9} version)
+          (when (contains? #{7 8 9 10} version)
             {:population (mapv (fn [ind]
                                  (-> (if (:laws ind)
                                        ind
@@ -2766,10 +3140,19 @@
     (into (subvec pop 0 (- n ns)) seeds)))
 
 (defn resolve-initial-population
-  [{:keys [fresh? seed? path population-size strategy de-driven?]}]
+  [{:keys [fresh? seed? path population-size strategy de-driven? both-regimes?]}]
   (let [seeds (when seed?
-                (if de-driven?
+                (cond
+                  (and de-driven? (= strategy :analytical) both-regimes?)
+                  (both-regimes-analytical-seeds)
+
+                  (and de-driven? (= strategy :analytical))
+                  (filterv #(= (:strategy %) :analytical) physics-seeds)
+
+                  de-driven?
                   de-driven-composite-seeds
+
+                  :else
                   (cond->> physics-seeds
                     strategy (filterv #(= (:strategy %) strategy)))))
         base  (if fresh?
@@ -2813,6 +3196,8 @@
                :scenario-seed nil
                :guess-mutations? true
                :de-driven? false
+               :both-regimes? false
+               :domain-filter? false
                :strategy nil}        ; nil = all strategies; or :analytical/:differential/:conserved
          xs args]
     (if (empty? xs)
@@ -2839,6 +3224,8 @@
           "--fitness-percentile" (recur (assoc opts :fitness-percentile (Long/parseLong (first more))) (rest more))
           "--scenario-seed" (recur (assoc opts :scenario-seed (Long/parseLong (first more))) (rest more))
           "--de-driven" (recur (assoc opts :de-driven? true) more)
+          "--both-regimes" (recur (assoc opts :both-regimes? true) more)
+          "--domain-filter" (recur (assoc opts :domain-filter? true) more)
           "--no-guess" (recur (assoc opts :guess-mutations? false) more)
           "--mcts-simulations" (recur (assoc opts :mcts-simulations (Long/parseLong (first more))) (rest more))
           "--mcts-inject" (recur (assoc opts :mcts-inject (Long/parseLong (first more))) (rest more))
@@ -2848,14 +3235,19 @@
           "--strategy" (recur (assoc opts :strategy (keyword (first more))) (rest more))
           (throw (ex-info "Unknown argument"
                           {:arg a
-                           :hint "--fresh --de-driven --fixed-scenarios --random-scenarios --scenario-samples N --fitness-aggregate min|percentile --fitness-percentile P --scenario-seed N --no-guess --no-mcts ..."})))))))
+                           :hint "--fresh --de-driven --both-regimes --domain-filter --strategy analytical ..."})))))))
 
 (defn- distinct-elites
   "Elite tier for one generation. During escape burst, collapse behaviorally identical clones."
   [scored elite-cap probes behavior-diverse? cache]
-  (if behavior-diverse?
-    (take elite-cap (take-distinct-by-behavior (count scored) scored probes cache))
-    (take elite-cap (distinct scored))))
+  (cond
+    *fast-breeding?* (take elite-cap scored)
+    behavior-diverse? (take-distinct-by-behavior elite-cap scored probes cache)
+    :else (take elite-cap (distinct scored))))
+
+(defn- pick-other-elite [parent elites]
+  (let [others (vec (remove #(identical? % parent) elites))]
+    (when (seq others) (rand-nth others))))
 
 (defn evolve-generation
   [population fitness-ctx population-size generation-index
@@ -2902,33 +3294,48 @@
                                         :phase-states phase-states))
                                      0.0)))
                         population)))
+        _ (when score-progress?
+            (do (println (format "    %s scored; breeding..." (or gen-label "gen")))
+                (flush)))
         scored      (sort-by :fitness #(compare %2 %1) scored)
-        unique-elites (distinct-elites scored elite-cap behavior-probes behavior-diverse-elites? cache)
+        unique-elites (do
+                        (when score-progress?
+                          (println (format "    %s elites (%d)..." (or gen-label "gen")
+                                           elite-cap))
+                          (flush))
+                        (distinct-elites scored elite-cap behavior-probes
+                                         behavior-diverse-elites? cache))
         n-elites      (count unique-elites)
         breed-slots   (max 0 (- population-size immigrant-n))
-        branch        (long (Math/ceil (/ breed-slots (double n-elites))))]
+        branch        (long (Math/ceil (/ breed-slots (double n-elites))))
+        bred          (do
+                        (when score-progress?
+                          (println (format "    %s mutating %d slots..."
+                                           (or gen-label "gen") breed-slots))
+                          (flush))
+                        (take breed-slots
+                              (mapcat (fn [parent]
+                                        (cons parent
+                                              (take (dec branch)
+                                                    (repeatedly
+                                                     #(if-let [other (when (and (> (count unique-elites) 1)
+                                                                                 (< (rand) 0.7))
+                                                                            (pick-other-elite parent unique-elites))]
+                                                        (or (crossover-individuals parent other)
+                                                            (mutate-individual parent))
+                                                        (mutate-individual parent))))))
+                                      unique-elites)))]
     (vec (take population-size
                (concat
-                ;; Elites + their offspring (crossover or mutation).
-                ;; Capped at breed-slots so immigrants always get their reserved slots.
-                (take breed-slots
-                      (mapcat (fn [parent]
-                                (cons parent
-                                      (take (dec branch)
-                                            (repeatedly
-                                             #(if (and (> (count unique-elites) 1) (< (rand) 0.7))
-                                                ;; Cross-pollination with a randomly chosen
-                                                ;; different elite; fall back to mutation if
-                                                ;; strategies differ.
-                                                (let [other (rand-nth (remove #{parent} unique-elites))]
-                                                  (or (crossover-individuals parent other)
-                                                      (mutate-individual parent)))
-                                                (mutate-individual parent))))))
-                              unique-elites))
-                ;; Fresh random immigrants — guaranteed to appear every generation.
-                (binding [*fast-immigrants?* (or *fast-immigrants?* (> extra-immigrants 5))
-                          *preferred-law-chart* (coords/dominant-chart datasets)]
-                  (repeatedly immigrant-n random-individual)))))))
+                bred
+                (do
+                  (when score-progress?
+                    (println (format "    %s immigrants (%d)..."
+                                     (or gen-label "gen") immigrant-n))
+                    (flush))
+                  (binding [*fast-immigrants?* (or *fast-immigrants?* (> extra-immigrants 5))
+                            *preferred-law-chart* (coords/dominant-chart datasets)]
+                    (repeatedly immigrant-n random-individual))))))))
 
 (defn- prompt-continue-evolution? []
   (print "  Enter = next generation, q = stop and save: ")
@@ -2939,27 +3346,38 @@
   (timbre/merge-config! {:min-level :warn})
   (let [{:keys [fresh? seed? path generations population-size prompt-each-generation
                 fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile
-                strategy guess-mutations?]}
+                strategy guess-mutations? both-regimes? domain-filter?]}
         (parse-args args)
         de-driven? (= :de-driven (:evaluation fitness-context))
+        both-regimes-on? (or both-regimes?
+                             (and de-driven? (= strategy :analytical) (not domain-filter?)))
         report-scenarios default-scenarios
         ref-datasets (scenarios->datasets report-scenarios)
         preferred-chart (coords/dominant-chart ref-datasets)]
   (binding [*strategy-filter* strategy
             *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)
             *de-driven-search?* de-driven?
+            *both-regimes?* both-regimes-on?
             *preferred-law-chart* preferred-chart]
   (when (and de-driven? (= strategy :differential))
     (println "warning: --strategy differential with --de-driven scores 0 (DE is already known)"))
   (when de-driven?
-    (println "Each individual: analytical laws (motion DE) + conserved laws (invariants along orbits, not DE solutions)"))
+    (println
+     (if (= strategy :analytical)
+       (str "Each individual: analytical laws only (short-horizon orbit fit)"
+            (when both-regimes-on?
+              "; both regimes (all scenarios, require e/if on energy)"))
+       (if (= strategy :conserved)
+         "Each individual: analytical laws + conserved laws (composite; min fitness)"
+         "Each individual: analytical laws (motion DE) + conserved laws (invariants along orbits, not DE solutions)"))))
   (let [{:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
                                      :seed?  seed?
                                      :path path
                                      :population-size population-size
                                      :strategy strategy
-                                     :de-driven? de-driven?})
+                                     :de-driven? de-driven?
+                                     :both-regimes? both-regimes-on?})
         initial (normalize-population-size population population-size)
         fit-opts (select-keys fitness-context [:aggregate :percentile :evaluation])
         eval-phase-states (when de-driven?
@@ -3021,21 +3439,17 @@
                                               (assoc (vec pop) (dec (count pop))
                                                      (:ind @hall-of-fame))
                                               pop)
-                           hof-behavior     (when (and escape-burst? @hall-of-fame)
-                                              (behavior-key-for (:ind @hall-of-fame)
-                                                                behavior-probes-lite
-                                                                behavior-cache))
+                           hof-gk           (when (and escape-burst? @hall-of-fame)
+                                              (individual-genome-key (:ind @hall-of-fame)))
                            pop-diverse      (binding [*fast-immigrants?* (or escape-burst? escape-deep?)]
                                               (cond
                                                 escape-deep?
                                                 (vec (repeatedly population-size random-individual))
 
                                                 escape-burst?
-                                                (let [without-basin (if hof-behavior
-                                                                      (vec (remove #(= hof-behavior
-                                                                                       (behavior-key-for %
-                                                                                                          behavior-probes-lite
-                                                                                                          behavior-cache))
+                                                (let [without-basin (if hof-gk
+                                                                      (vec (remove #(= hof-gk
+                                                                                       (individual-genome-key %))
                                                                                    pop-with-hof))
                                                                       pop-with-hof)
                                                       n-keep (max 0 (quot population-size 5))
@@ -3046,29 +3460,32 @@
 
                                                 :else pop-with-hof))
                            pop' (binding [*stagnation-escape?* (or escape-burst? escape-deep?)
+                                          *fast-breeding?* (or escape-burst? escape-deep?)
                                           *fast-immigrants?* (or escape-burst? escape-deep?)
                                           *fitness-timeout-ms* (when (or escape-burst? escape-deep?)
-                                                                 180000)]
+                                                                 90000)]
                                   (evolve-generation pop-diverse fitness-context population-size gen-idx
                                                      :extra-immigrants extra-imm
                                                      :elite-divisor elite-divisor
                                                      :behavior-probes behavior-probes-lite
-                                                     :behavior-diverse-elites? escape-burst?
+                                                     :behavior-diverse-elites? false
                                                      :behavior-cache behavior-cache
                                                      :score-progress? (or escape-burst? escape-deep?)
                                                      :gen-label (format "gen %d" (inc gen-idx))))
                            gens (+ generations-run (inc gen-idx))
                            {:keys [best mean median]} (population-fitness-stats pop')
-                           ;; Eval every elite individual on the fixed reference scenarios and
-                           ;; pick the best — more robust than trusting training rank alone.
-                           elite-inds (filter :fitness pop')
+                           ;; Re-eval top training elites on fixed reference scenarios (not whole pop).
+                           elite-inds (->> pop' (sort-by :fitness #(compare %2 %1)) (take 5))
+                           eval-timeout (when (or escape-burst? escape-deep?) 90000)
                            eval-pairs (keep (fn [ind]
-                                              (let [s (calculate-fitness-scenarios
-                                                       ind ref-datasets
-                                                       :aggregate (:aggregate fit-opts)
-                                                       :percentile (:percentile fit-opts)
-                                                       :evaluation (:evaluation fit-opts)
-                                                       :phase-states eval-phase-states)]
+                                              (let [s (call-with-timeout
+                                                       eval-timeout "eval"
+                                                       #(calculate-fitness-scenarios
+                                                         ind ref-datasets
+                                                         :aggregate (:aggregate fit-opts)
+                                                         :percentile (:percentile fit-opts)
+                                                         :evaluation (:evaluation fit-opts)
+                                                         :phase-states eval-phase-states))]
                                                 (when (pos? s) [ind s])))
                                             elite-inds)
                            [best-eval-ind eval-best] (when (seq eval-pairs)
@@ -3131,7 +3548,7 @@
     (println "total generations (cumulative):" total-generations)
     (println (str "fitness mode: " (name fitness-mode)
                   (when de-driven?
-                    " | evaluation: DE-driven (analytical ODE residual + conserved orbit invariance)")
+                    " | evaluation: DE-driven (analytical short-horizon orbits + conserved invariance)")
                   (when-not de-driven?
                     (str " | scenarios/gen: " (if (= fitness-mode :fixed)
                                                 (count default-scenarios)
@@ -3158,9 +3575,16 @@
             (println (str "    law " (inc li) " (" (name (law-kind law)) "):")))
           (case (law-kind law)
             :analytical
-            (let [keys (coords/analytical-expr-keys-for-chart (infer-law-chart law))]
-              (doseq [k keys]
-                (println (str "    " (name k) ":" (pr-str (normalize-expr (get law k)))))))
+            (do
+              (when (analytical-branches-on-energy? law)
+                (println "    regime:branched (e/if neg? energy)"))
+              (when (and (not both-regimes-on?)
+                         (not= (analytical-law-domain law) :any)
+                         (not (analytical-branches-on-energy? law)))
+                (println (str "    domain:" (name (analytical-law-domain law)))))
+              (let [keys (coords/analytical-expr-keys-for-chart (infer-law-chart law))]
+                (doseq [k keys]
+                  (println (str "    " (name k) ":" (pr-str (normalize-expr (get law k))))))))
             :differential
             (doseq [k differential-expr-keys]
               (println (str "    " (name k) ":" (pr-str (normalize-expr (get law k))))))
@@ -3171,9 +3595,19 @@
     (doseq [scenario report-scenarios]
       (let [dataset (scenario-data scenario)]
         (doseq [[li law] (map-indexed vector (individual-laws best))]
-          (let [metrics (evaluate-predictions (law->legacy law) dataset)]
+          (let [metrics (evaluate-predictions (law->legacy law) dataset)
+                regime  (or (:regime dataset) (scenario-regime dataset))]
             (println (str "  " (name (:id scenario))
+                          " [" (name regime) "]"
                           (when (> (count (individual-laws best)) 1)
                             (str " law-" (inc li)))
                           " " (name (:strategy metrics))
-                          " mse=" (format "%.6f" (:mse metrics))))))))))))
+                          (when (= (:strategy metrics) :analytical)
+                            (cond
+                              (analytical-branches-on-energy? (law->legacy law))
+                              " regime=branched"
+                              both-regimes-on?
+                              " regime=both"
+                              :else
+                              (str " domain=" (name (analytical-law-domain (law->legacy law))))))
+                          " mse=" (format-mse (:mse metrics))))))))))))
