@@ -402,7 +402,7 @@
                           :score (adversarial-fitness ind adversarial-dataset
                                                       all-datasets fit-opts)}))
                      candidates)]
-    (or (apply max-key :score scored)
+    (or (when (seq scored) (apply max-key :score scored))
         {:individual seed-ind
          :score (adversarial-fitness seed-ind adversarial-dataset
                                      all-datasets fit-opts)})))

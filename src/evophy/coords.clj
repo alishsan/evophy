@@ -97,7 +97,10 @@
   [datasets]
   (if (empty? datasets)
     :cartesian
-    (->> datasets (map #(or (:chart %) :cartesian)) frequencies (apply max-key val))))
+    (let [freqs (frequencies (map #(or (:chart %) :cartesian) datasets))]
+      (if (empty? freqs)
+        :cartesian
+        (key (apply max-key val freqs))))))
 
 (defn state-vars-for-chart [chart]
   (case (keyword chart)

@@ -3584,8 +3584,9 @@
                   (when (or score-progress? (seq repairs))
                     (println (format "    %s immigrants (%d%s)..."
                                      (or gen-label "gen") immigrant-n
-                                     (when (seq repairs)
-                                       (str ", " (count repairs) " MCTS repair"))))
+                                     (if (seq repairs)
+                                       (str ", " (count repairs) " MCTS repair")
+                                       "")))
                     (flush))
                   (binding [*fast-immigrants?* (or *fast-immigrants?* (> extra-immigrants 5))
                             *preferred-law-chart* (coords/dominant-chart datasets)]
