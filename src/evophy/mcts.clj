@@ -8,6 +8,7 @@
 (def ^:private hole '__hole__)
 (def ^:private default-exploration 1.41)
 (def ^:private max-expr-depth 4)
+(def ^:private repair-genetic-samples 6)
 
 (def ^:private analytical-phases [:qx :qy :px :py])
 (def ^:private phase->expr-key
@@ -85,6 +86,16 @@
                         [:binary op])))]
     (if (empty? ops) terminals (vec (concat terminals ops)))))
 
+(defn- legal-actions-deterministic [depth vars]
+  (let [terminals (for [s (concat vars core/constants)] [:term s])
+        ops (if (zero? depth)
+              []
+              (concat (for [op core/unary-ops] [:unary op])
+                      (for [op core/ops
+                            :when (not (contains? core/unary-ops op))]
+                        [:binary op])))]
+    (if (empty? ops) terminals (vec (concat terminals ops)))))
+
 (defn- apply-action [expr path action]
   (case (first action)
     :term (replace-at-path expr path (second action))
@@ -96,6 +107,14 @@
     (let [depth (depth-at-hole expr path)
           action (rand-nth (legal-actions depth vars))]
       (complete-expr (apply-action expr path action) vars))
+    expr))
+
+(defn- complete-expr-deterministic [expr vars]
+  (if-let [path (find-hole-path expr)]
+    (let [depth (depth-at-hole expr path)
+          actions (legal-actions-deterministic depth vars)]
+      (when (seq actions)
+        (complete-expr-deterministic (apply-action expr path (first actions)) vars)))
     expr))
 
 (defn- initial-state []
@@ -331,15 +350,14 @@
         (assoc expr-key (apply-action expr path action))
         repair-advance-phase)))
 
-(defn- repair-rollout-state [state]
-  (loop [s state]
-    (if (repair-terminal? s)
-      s
-      (if-let [pairs (seq (repair-state-action-pairs s))]
-        (recur (apply-repair-action s (rand-nth pairs)))
-        (let [vars core/analytical-vars
-              expr-key (:repair-key state)]
-          (assoc s expr-key (complete-expr (get s expr-key) vars)))))))
+(defn- repair-finish-state [state]
+  (if (repair-terminal? state)
+    state
+    (let [expr-key (:repair-key state)
+          vars core/analytical-vars
+          expr (or (complete-expr-deterministic (get state expr-key) vars)
+                   (get state expr-key))]
+      (assoc state expr-key expr))))
 
 (defn- wrap-repaired-slot-expr [expr]
   (let [ex (core/normalize-expr expr)]
@@ -367,6 +385,28 @@
                      core/ensure-analytical-uses-t)]
     (core/apply-analytical-repair base-ind repaired)))
 
+(defn- repair-genetic-eval [state base-ind adversarial-dataset all-datasets fit-opts]
+  "From an expanded MCTS repair node, finish the slot deterministically and score
+   the seed plus GP mutants (replaces random hole-filling rollout)."
+  (let [finished (repair-finish-state state)
+        seed-ind (repair-state->individual finished base-ind)
+        seed-leg (core/first-law-legacy seed-ind)
+        mutate (fn []
+                 (core/apply-analytical-repair base-ind
+                                               (core/gp-mutate-analytical seed-leg)))
+        candidates (cons seed-ind
+                           (repeatedly (dec repair-genetic-samples) mutate))
+        scored (keep (fn [ind]
+                       (when (core/genome-valid? ind)
+                         {:individual ind
+                          :score (adversarial-fitness ind adversarial-dataset
+                                                      all-datasets fit-opts)}))
+                     candidates)]
+    (or (apply max-key :score scored)
+        {:individual seed-ind
+         :score (adversarial-fitness seed-ind adversarial-dataset
+                                     all-datasets fit-opts)})))
+
 (defn- note-best-repair! [best-atom ind adversarial-dataset]
   (when (and adversarial-dataset (core/genome-valid? ind))
     (let [fit (repair-worst-scenario-fitness ind adversarial-dataset)]
@@ -384,13 +424,12 @@
                        :untried (vec (or (repair-state-action-pairs child-state) []))
                        :parent node})]
       (swap! node assoc-in [:children action] child)
-      (note-best-repair! best-atom
-                         (repair-state->individual (repair-rollout-state child-state)
-                                                   (:base-ind (:state @node)))
-                         adversarial-dataset)
-      (let [rolled (repair-rollout-state child-state)
-            ind (repair-state->individual rolled (:base-ind (:state @node)))
-            score (adversarial-fitness ind adversarial-dataset all-datasets fit-opts)]
+      (let [{:keys [individual score]} (repair-genetic-eval child-state
+                                                             (:base-ind (:state @node))
+                                                             adversarial-dataset
+                                                             all-datasets
+                                                             fit-opts)]
+        (note-best-repair! best-atom individual adversarial-dataset)
         (backprop! child score)))))
 
 (defn- traverse-repair [root adversarial-dataset all-datasets fit-opts best-atom]

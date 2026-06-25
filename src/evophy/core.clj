@@ -3077,6 +3077,11 @@
     (guess-mutate-individual ind)
     (random-block-mutate-individual ind)))
 
+(defn gp-mutate-analytical
+  "One GP edit on an analytical law (legacy map); no restart or MCTS."
+  [ind]
+  (validate-and-repair-law (mutate-analytical-gp ind)))
+
 (defn- mcts-mutate-roll? []
   (and *mcts-mutate?*
        (seq *mcts-mutate-datasets*)
