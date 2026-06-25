@@ -46,6 +46,12 @@ Use `--fresh` after checkpoint format changes or when you want a clean populatio
 | `--no-guess` | Disable guess-style subtree mutations |
 | `--prompt-each-generation` | Pause between generations (Enter / q) |
 | `--no-mcts` | (CLI only; main loop is GP) |
+| `--no-mcts-repair` | Disable adversarial MCTS slot repair immigrants |
+| `--mcts-repair-simulations N` | MCTS sims per repair (default 48) |
+| `--mcts-repair-inject N` | Max repair immigrants per generation (default 1; more during stagnation) |
+| `--no-mcts-mutate` | Disable MCTS slot repair during analytical mutation |
+| `--mcts-mutate-rate R` | Fraction of analytical mutates that try MCTS repair (default 0.2) |
+| `--mcts-mutate-simulations N` | MCTS sims per mutation attempt (default 48) |
 | `--mcts-simulations N` | MCTS rollouts when using `evophy.mcts` (default 64) |
 | `--mcts-inject N` | (CLI only) |
 
@@ -66,7 +72,7 @@ Analytical validity can be declared two ways:
 1. **`:domain` tag** — `:bound` (\(E<0\)), `:unbound` (\(E>0\)), or `:any` (legacy). Fitness and MSE run only on scenarios in that regime; mismatches are **n/a**, not penalized. Use `--domain-filter` with `--de-driven --strategy analytical` to keep this mode.
 2. **`(e/if (neg? energy) bound-branch unbound-branch)`** inside expressions — scored on every scenario; `energy` is \(H(q_0,p_0)\) pre-bound at compile time.
 
-**Both regimes (default for `--de-driven --strategy analytical`):** fitness uses **all** reference scenarios (bound + unbound); `:domain` tags are ignored; new genomes must include `(e/if (neg? energy) … …)` in at least one slot. Seeds are wrapped automatically. Opt out with `--domain-filter`.
+**Both regimes (default for `--de-driven --strategy analytical`):** fitness uses **all** reference scenarios; `:domain` tags are ignored; every analytical slot must be `(e/if (neg? energy) bound-arm unbound-arm)` with no bogus `e/if` tests. **Per-regime arm fitness:** bound arms are scored only on bound scenarios, unbound arms on unbound; overall fitness is `min(bound, unbound)`. Seeds are wrapped automatically. Opt out with `--domain-filter`.
 
 With `--de-driven`, analytical laws score short-horizon trajectory fit on integrated reference orbits; conserved laws score **temporal constancy along integrated orbits** (they are invariants, not solutions of the motion DE). Differential laws score 0 (the DE is already known).
 

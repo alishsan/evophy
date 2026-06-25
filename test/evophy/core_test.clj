@@ -398,7 +398,55 @@
                        (map (fn [[k ex]] [k (branch ex)])
                             (select-keys taylor [:qx-expr :qy-expr :px-expr :py-expr])))]
     (binding [*both-regimes?* true]
+      (is (analytical-strict-energy-branches? branched))
       (is (domain-applicable? unbound-only circle))
       (is (not (:skipped? (evaluate-predictions unbound-only circle))))
       (is (pos? (calculate-fitness-scenarios branched [circle hyper]
+                                             :evaluation :de-driven))))))
+
+(deftest both-regimes-rejects-bogus-e-if-branches
+  (let [branch (fn [ex] (list 'e/if '(neg? energy) ex ex))
+        taylor {:strategy :analytical :domain :any
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        good-qx (into taylor
+                      (map (fn [[k ex]] [k (branch ex)])
+                           (select-keys taylor [:qx-expr :qy-expr :px-expr :py-expr])))
+        bogus-py (assoc good-qx :py-expr
+                        (list 'e/if 't
+                              '(+ p0y (* (e/div p0x m) t))
+                              '(+ p0y (* (e/div p0y m) t))))]
+    (binding [*both-regimes?* true]
+      (is (analytical-strict-energy-branches? good-qx))
+      (is (not (analytical-strict-energy-branches? bogus-py)))
+      (is (zero? (calculate-fitness-scenarios bogus-py
+                                               [(scenario-data (first default-scenarios))]
                                                :evaluation :de-driven))))))
+
+(deftest per-regime-arm-fitness-scores-arms-separately
+  (let [datasets (scenarios->datasets default-scenarios)
+        bound-taylor '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+        branched {:strategy :analytical :domain :any
+                  :qx-expr (list 'e/if '(neg? energy)
+                                 '(+ q0x (* (e/div p0x m) t))
+                                 '(+ q0x (* (e/div p0x m) t)))
+                  :qy-expr (list 'e/if '(neg? energy)
+                                 '(+ q0y (* (e/div p0y m) t))
+                                 '(+ q0y (* (e/div p0y m) t)))
+                  :px-expr (list 'e/if '(neg? energy)
+                                 '(+ p0x (* 2.0 t))
+                                 bound-taylor)
+                  :py-expr (list 'e/if '(neg? energy)
+                                 '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))
+                                 '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t)))}
+        px-taylor-both (assoc branched :px-expr
+                              (list 'e/if '(neg? energy) bound-taylor bound-taylor))]
+    (binding [*both-regimes?* true]
+      (is (analytical-strict-energy-branches? branched))
+      (let [junk-fit (calculate-fitness-scenarios branched datasets :evaluation :de-driven)
+            clean-fit (calculate-fitness-scenarios px-taylor-both datasets :evaluation :de-driven)]
+        (is (pos? junk-fit))
+        (is (pos? clean-fit))
+        (is (< junk-fit clean-fit))))))

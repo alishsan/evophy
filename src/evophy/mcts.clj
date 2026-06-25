@@ -12,6 +12,8 @@
 (def ^:private analytical-phases [:qx :qy :px :py])
 (def ^:private phase->expr-key
   {:qx :qx-expr :qy :qy-expr :px :px-expr :py :py-expr})
+(def ^:private expr-key->phase
+  (zipmap (vals phase->expr-key) (keys phase->expr-key)))
 
 (defonce ^:private stop-flag (atom false))
 (defonce ^:private handler-installed? (atom false))
@@ -153,15 +155,35 @@
 
 (defonce ^:private fitness-cache (atom {}))
 
-(defn- fitness-for-individual [ind datasets]
+(defn- fitness-for-individual [ind datasets & {:keys [evaluation aggregate percentile]}]
   (if (core/genome-valid? ind)
     (let [k (core/individual-genome-key ind)]
       (if-let [hit (@fitness-cache k)]
         hit
-        (let [fit (core/calculate-fitness-scenarios ind datasets)]
+        (let [fit (core/calculate-fitness-scenarios ind datasets
+                                                   :evaluation (or evaluation :de-driven)
+                                                   :aggregate (or aggregate :min)
+                                                   :percentile (or percentile 0.1))]
           (swap! fitness-cache assoc k fit)
           fit)))
     0.0))
+
+(defn- adversarial-fitness [ind adversarial-dataset all-datasets fit-opts]
+  (let [leg (core/first-law-legacy ind)
+        adv (when (and (= :analytical (:strategy leg)) adversarial-dataset)
+              (core/calculate-analytical-fitness-at-horizon
+               leg adversarial-dataset core/repair-horizon-frac))
+        full (fitness-for-individual ind all-datasets fit-opts)]
+    (if (and adv (pos? adv))
+      (+ (* 0.75 adv) (* 0.25 full))
+      full)))
+
+(defn- repair-worst-scenario-fitness [ind dataset]
+  (let [leg (core/first-law-legacy ind)]
+    (if (and dataset (= :analytical (:strategy leg)))
+      (core/calculate-analytical-fitness-at-horizon
+       leg dataset core/repair-horizon-frac)
+      0.0)))
 
 (defn- score-state [state datasets]
   (fitness-for-individual (state->individual (rollout-state state)) datasets))
@@ -273,3 +295,189 @@
     (if (or (>= i n) (stop-requested?))
       acc
       (recur (inc i) (conj acc (search-analytical-individual datasets max-simulations))))))
+
+;; ── Adversarial repair (patch weakest slot on HoF / elite) ───────────────────
+
+(defn- repair-state-from-individual [ind expr-key]
+  (let [leg (core/first-law-legacy ind)
+        phase (expr-key->phase expr-key)]
+    (into {:phase phase :repair-key expr-key}
+          (map (fn [k]
+                 [k (if (= k expr-key)
+                      hole
+                      (core/normalize-expr (get leg k)))])
+               core/analytical-expr-keys))))
+
+(defn- repair-terminal? [state]
+  (not (find-hole-path (get state (:repair-key state)))))
+
+(defn- repair-advance-phase [state]
+  (if (find-hole-path (get state (:repair-key state)))
+    state
+    (assoc state :phase :done)))
+
+(defn- repair-state-action-pairs [state]
+  (when-let [path (find-hole-path (get state (:repair-key state)))]
+    (let [expr (get state (:repair-key state))
+          depth (depth-at-hole expr path)
+          vars core/analytical-vars]
+      (map (fn [action] {:path path :action action})
+           (legal-actions depth vars)))))
+
+(defn- apply-repair-action [state {:keys [path action]}]
+  (let [expr-key (:repair-key state)
+        expr (get state expr-key)]
+    (-> state
+        (assoc expr-key (apply-action expr path action))
+        repair-advance-phase)))
+
+(defn- repair-rollout-state [state]
+  (loop [s state]
+    (if (repair-terminal? s)
+      s
+      (if-let [pairs (seq (repair-state-action-pairs s))]
+        (recur (apply-repair-action s (rand-nth pairs)))
+        (let [vars core/analytical-vars
+              expr-key (:repair-key state)]
+          (assoc s expr-key (complete-expr (get s expr-key) vars)))))))
+
+(defn- wrap-repaired-slot-expr [expr]
+  (let [ex (core/normalize-expr expr)]
+    (if (and (sequential? ex)
+             (= 'e/if (first ex))
+             (= '(neg? energy) (second ex)))
+      ex
+      (list 'e/if '(neg? energy) ex ex))))
+
+(defn- repair-state->individual [state base-ind]
+  (let [leg (core/first-law-legacy base-ind)
+        repair-key (:repair-key state)
+        repaired (into leg
+                       (map (fn [k]
+                              (let [ex (core/normalize-expr (get state k))]
+                                [k (if (= k repair-key)
+                                     (if core/*both-regimes?*
+                                       (wrap-repaired-slot-expr ex)
+                                       ex)
+                                     ex)]))
+                            core/analytical-expr-keys))
+        repaired (-> repaired
+                     (core/ensure-symbol-coverage core/analytical-expr-keys
+                                                  core/required-analytical-symbols)
+                     core/ensure-analytical-uses-t)]
+    (core/apply-analytical-repair base-ind repaired)))
+
+(defn- note-best-repair! [best-atom ind adversarial-dataset]
+  (when (and adversarial-dataset (core/genome-valid? ind))
+    (let [fit (repair-worst-scenario-fitness ind adversarial-dataset)]
+      (when (> fit (:repair-fitness @best-atom))
+        (swap! best-atom assoc :repair-fitness fit :individual ind)))))
+
+(defn- expand-repair! [node adversarial-dataset all-datasets fit-opts best-atom]
+  (when-let [pair (first (:untried @node))]
+    (swap! node update :untried rest)
+    (let [child-state (apply-repair-action (:state @node) pair)
+          action (:action pair)
+          child (atom {:state child-state
+                       :visits 0 :value-sum 0.0
+                       :children {}
+                       :untried (vec (or (repair-state-action-pairs child-state) []))
+                       :parent node})]
+      (swap! node assoc-in [:children action] child)
+      (note-best-repair! best-atom
+                         (repair-state->individual (repair-rollout-state child-state)
+                                                   (:base-ind (:state @node)))
+                         adversarial-dataset)
+      (let [rolled (repair-rollout-state child-state)
+            ind (repair-state->individual rolled (:base-ind (:state @node)))
+            score (adversarial-fitness ind adversarial-dataset all-datasets fit-opts)]
+        (backprop! child score)))))
+
+(defn- traverse-repair [root adversarial-dataset all-datasets fit-opts best-atom]
+  (loop [node root]
+    (cond
+      (seq (:untried @node))
+      (do (expand-repair! node adversarial-dataset all-datasets fit-opts best-atom) node)
+
+      (seq (:children @node))
+      (let [[_ child-atom _] (select-child node default-exploration)]
+        (recur child-atom))
+
+      :else node)))
+
+(defn search-repair-individual
+  "MCTS adversarial repair: keep HoF/elite fixed except one weak slot, re-search that slot
+   against the individual's worst scenario. Returns repaired individual or base-ind on failure.
+
+   Optional :fitness-opts map passed to aggregate fitness; :on-progress {:sim :best-fitness}."
+  [base-ind all-datasets max-simulations & {:keys [should-stop? on-progress fitness-opts quiet?]
+                                            :or {should-stop? stop-requested?
+                                                 fitness-opts {}
+                                                 quiet? false}}]
+  (if (zero? max-simulations)
+    base-ind
+    (if-let [target (core/adversarial-repair-target base-ind all-datasets)]
+      (let [{:keys [dataset expr-key scenario-id]} target
+            fit-opts (merge {:evaluation :de-driven :aggregate :min :percentile 0.1}
+                            fitness-opts)
+            root-state (assoc (repair-state-from-individual base-ind expr-key)
+                              :base-ind base-ind)
+            _ (when (and scenario-id (not quiet?))
+                (println (format "  [MCTS repair] scenario=%s slot=%s horizon=%.0f%%"
+                                 (name scenario-id) (name expr-key)
+                                 (* 100.0 core/repair-horizon-frac))))
+            parent-repair-fit (repair-worst-scenario-fitness base-ind dataset)
+            root (atom {:state root-state
+                        :visits 0 :value-sum 0.0
+                        :children {}
+                        :untried (vec (or (repair-state-action-pairs root-state) []))
+                        :parent nil})
+            best (atom {:repair-fitness parent-repair-fit :individual base-ind})
+            ran (loop [sim 0]
+                  (if (or (>= sim max-simulations) (should-stop?))
+                    sim
+                    (do
+                      (traverse-repair root dataset all-datasets fit-opts best)
+                      (when on-progress
+                        (on-progress {:sim (inc sim)
+                                      :best-fitness (:repair-fitness @best)}))
+                      (recur (inc sim)))))]
+        (let [ind (or (:individual @best) base-ind)
+              improved? (> (:repair-fitness @best) parent-repair-fit)
+              result (if improved? ind base-ind)
+              stopped? (should-stop?)]
+          (reset! last-search-stats
+                  {:individual result
+                   :simulations-run ran
+                   :max-simulations max-simulations
+                   :best-fitness (:repair-fitness @best)
+                   :parent-repair-fitness parent-repair-fit
+                   :improved? improved?
+                   :stopped? stopped?
+                   :repair? true
+                   :repair-target target})
+          (when (and (not quiet?) stopped? (pos? ran))
+            (println (str "[MCTS repair] stopped after " ran " simulation"
+                          (when (not= 1 ran) "s")
+                          " (repair fitness " (format "%.4f" (:repair-fitness @best))
+                          " vs parent " (format "%.4f" parent-repair-fit) ")")))
+          (when (and (not quiet?) (pos? ran) (not improved?))
+            (println (format "  [MCTS repair] no improvement on %.0f%% horizon (%.4f <= %.4f)"
+                             (* 100.0 core/repair-horizon-frac)
+                             (:repair-fitness @best) parent-repair-fit)))
+          result))
+      base-ind)))
+
+(defn generation-repair-inject
+  "Up to n adversarial repairs from one source individual (typically HoF).
+   Skips repairs that do not improve worst-scenario fitness at [[core/repair-horizon-frac]]."
+  [base-ind datasets max-simulations n]
+  (loop [i 0 acc []]
+    (if (or (>= i n) (stop-requested?))
+      acc
+      (let [repaired (search-repair-individual base-ind datasets max-simulations)
+            stats (last-search-result)]
+        (recur (inc i)
+               (if (:improved? stats)
+                 (conj acc repaired)
+                 acc))))))

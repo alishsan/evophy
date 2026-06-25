@@ -644,6 +644,10 @@
          n  (max 1 (int (Math/ceil (* frac (count ts)))))]
      (vec (take n ts)))))
 
+(def repair-horizon-frac
+  "Horizon fraction for MCTS adversarial repair fitness (longer than the 8% GP default)."
+  0.20)
+
 (defn- initial-ics [data]
   (let [{:keys [qx qy px py]} (first data)]
     {:q0x (double qx) :q0y (double qy) :p0x (double px) :p0y (double py)}))
@@ -818,7 +822,7 @@
     (composite-individual? ind) :composite
     :else (or (some law-kind (individual-laws ind)) :unknown)))
 
-(defn- first-law-legacy [ind]
+(defn first-law-legacy [ind]
   (law->legacy (if (seq (:laws ind)) (first (:laws ind)) ind)))
 
 (defn- individual-with-law [ind law]
@@ -900,6 +904,62 @@
        (= 3 (count (rest expr)))
        (expr-energy-regime-test? (second expr))))
 
+(declare normalize-expr)
+
+(defn- expr-all-eifs-use-energy-test? [expr]
+  "Every e/if in the tree must branch on (neg? energy) — rejects (e/if t …) and (e/if (neg? q0y) …)."
+  (let [expr (normalize-expr expr)]
+    (every? (fn [node]
+              (or (not (sequential? node))
+                  (not= 'e/if (first node))
+                  (expr-energy-regime-test? (second node))))
+            (tree-seq sequential? seq expr))))
+
+(defn analytical-strict-energy-branches?
+  "Both-regimes validity: every analytical slot is (e/if (neg? energy) … …) with no bogus e/if tests."
+  [law]
+  (let [leg   (if (:strategy law) law (law->legacy law))
+        chart (infer-law-chart leg)
+        keys  (coords/analytical-expr-keys-for-chart chart)]
+    (boolean
+     (and (seq keys)
+          (every? (fn [k]
+                    (when-let [ex (get leg k)]
+                      (and (expr-regime-branch? ex)
+                           (expr-all-eifs-use-energy-test? ex))))
+                  keys)))))
+
+(defn- regime-arm-expr
+  "Bound => then-branch; unbound (and parabolic) => else-branch of (e/if (neg? energy) … …)."
+  [expr regime]
+  (let [ex (normalize-expr expr)]
+    (if (expr-regime-branch? ex)
+      (let [args (vec (rest ex))
+            then-branch (nth args 1)
+            else-branch (nth args 2)]
+        (if (= regime :bound) then-branch else-branch))
+      ex)))
+
+(defn- dataset-regime-for-fitness [dataset]
+  (let [r (or (:regime dataset) (scenario-regime dataset))]
+    (if (= r :bound) :bound :unbound)))
+
+(defn analytical-law-regime-slice
+  "Law with each slot replaced by its bound or unbound arm (no outer e/if)."
+  [law regime]
+  (let [leg   (if (:strategy law) law (law->legacy law))
+        chart (infer-law-chart leg)
+        keys  (coords/analytical-expr-keys-for-chart chart)]
+    (into leg
+          (map (fn [k] [k (regime-arm-expr (get leg k) regime)])
+               keys))))
+
+(defn- analytical-slice-valid? [ind chart]
+  (let [keys     (coords/analytical-expr-keys-for-chart chart)
+        required (coords/required-analytical-symbols-for-chart chart)]
+    (and (every? #(expr-uses-t? (get ind %)) keys)
+         (symbols-covered-across-exprs? keys ind required))))
+
 (defn analytical-branches-on-energy?
   "True when any analytical slot uses (e/if (neg? energy) bound-branch unbound-branch)."
   [law]
@@ -931,6 +991,9 @@
   "When true, analytical fitness/MSE use every scenario; genomes must branch on (neg? energy)."
   false)
 
+(defn- per-regime-arm-fitness? [ind]
+  (and *both-regimes?* (analytical-strict-energy-branches? ind)))
+
 (defn domain-applicable?
   "True when an analytical law should be scored on this scenario/dataset.
    Laws with (e/if (neg? energy) … …) apply to every scenario; :domain tags restrict.
@@ -955,7 +1018,7 @@
     (and (every? #(expr-uses-t? (get ind %)) keys)
          (symbols-covered-across-exprs? keys ind required)
          (or (not *both-regimes?*)
-             (analytical-branches-on-energy? ind)))))
+             (analytical-strict-energy-branches? ind)))))
 
 (declare conserved-vals-for-dataset conserved-dot-vals-for-dataset)
 
@@ -1237,23 +1300,26 @@
   (if-not (domain-applicable? ind dataset)
     {:strategy :analytical :n-horizons 0 :skipped? true
      :mse-q nil :mse-p nil :mse nil}
-    (let [chart (analytical-fitness-chart ind dataset)]
-    (if-not (coords/analytical-exprs-present? ind chart)
-      {:strategy :analytical :n-horizons 0
-       :mse-q Double/POSITIVE_INFINITY :mse-p Double/POSITIVE_INFINITY
-       :mse Double/POSITIVE_INFINITY}
-      (let [{:keys [data]} dataset
-            times (all-horizon-times data)
-            fns (compile-analytical-fns ind chart)
-            ds  (assoc dataset :chart chart)
-            {:keys [sq-q sq-p n]} (horizon-errors-analytical fns ds times)]
-        (if (zero? n)
-          {:strategy :analytical :n-horizons 0
-           :mse-q Double/POSITIVE_INFINITY :mse-p Double/POSITIVE_INFINITY
-           :mse Double/POSITIVE_INFINITY}
-          (let [n (double n)]
-            {:strategy :analytical :n-horizons (long n)
-             :mse-q (/ sq-q n) :mse-p (/ sq-p n) :mse (/ (+ sq-q sq-p) n)})))))))
+    (let [leg (if (per-regime-arm-fitness? ind)
+                (analytical-law-regime-slice ind (dataset-regime-for-fitness dataset))
+                ind)
+          chart (analytical-fitness-chart leg dataset)]
+      (if-not (coords/analytical-exprs-present? leg chart)
+        {:strategy :analytical :n-horizons 0
+         :mse-q Double/POSITIVE_INFINITY :mse-p Double/POSITIVE_INFINITY
+         :mse Double/POSITIVE_INFINITY}
+        (let [{:keys [data]} dataset
+              times (all-horizon-times data)
+              fns (compile-analytical-fns leg chart)
+              ds  (assoc dataset :chart chart)
+              {:keys [sq-q sq-p n]} (horizon-errors-analytical fns ds times)]
+          (if (zero? n)
+            {:strategy :analytical :n-horizons 0
+             :mse-q Double/POSITIVE_INFINITY :mse-p Double/POSITIVE_INFINITY
+             :mse Double/POSITIVE_INFINITY}
+            (let [n (double n)]
+              {:strategy :analytical :n-horizons (long n)
+               :mse-q (/ sq-q n) :mse-p (/ sq-p n) :mse (/ (+ sq-q sq-p) n)})))))))
 
 (defn- evaluate-differential-predictions [ind dataset]
   (let [fns {:dqx (compile-rate-fn (:dqx-expr ind))
@@ -2007,6 +2073,25 @@
   "When true, immigrants and default strategy mix exclude :differential (redundant with known ODE)."
   false)
 
+(def default-mcts-mutate-rate 0.2)
+(def default-mcts-mutate-simulations 48)
+
+(def ^:dynamic *mcts-mutate?*
+  "When true, analytical mutate-individual may run MCTS slot repair instead of GP tree walk."
+  false)
+
+(def ^:dynamic *mcts-mutate-rate*
+  "Probability of attempting MCTS repair on each analytical mutation (not restart/crossover)."
+  default-mcts-mutate-rate)
+
+(def ^:dynamic *mcts-mutate-simulations*
+  "MCTS simulations per mutation attempt."
+  default-mcts-mutate-simulations)
+
+(def ^:dynamic *mcts-mutate-datasets*
+  "Scenario datasets for MCTS mutation fitness (set during evolve-generation)."
+  nil)
+
 (defn- random-law [kind]
   (law-from-legacy
    (case kind
@@ -2243,22 +2328,84 @@
             0.0
             (/ 1.0 (+ (/ rmse (double D)) 1.0))))))))
 
+(declare calculate-analytical-slice-fitness-at-horizon)
+
+(defn calculate-analytical-fitness-at-horizon
+  ([ind dataset] (calculate-analytical-fitness-at-horizon ind dataset 0.08))
+  ([ind dataset horizon-frac]
+   (try
+     (cond
+       (not (analytical-genome-valid? ind))
+       0.0
+
+       (per-regime-arm-fitness? ind)
+       (calculate-analytical-slice-fitness-at-horizon
+        (analytical-law-regime-slice ind (dataset-regime-for-fitness dataset))
+        dataset horizon-frac)
+
+       :else
+       (let [chart (analytical-fitness-chart ind dataset)]
+         (if (coords/analytical-exprs-present? ind chart)
+           (let [{:keys [data]} dataset
+                 D    (char-scale data)
+                 fns  (compile-analytical-fns ind chart)
+                 ds   (assoc dataset :chart chart)
+                 errors (horizon-errors-analytical fns ds (short-horizon-times data horizon-frac))]
+             (fitness-from-errors errors D))
+           0.0)))
+     (catch Exception _ 0.0))))
+
 (defn calculate-analytical-fitness [ind dataset]
   ;; Analytical expressions cannot predict full Keplerian trajectories (transcendental).
   ;; We evaluate only the short-horizon portion where Taylor expansion approximations
   ;; (q ≈ q₀ + v₀t + ½·F·t², p ≈ p₀ + F·t) are achievable by GP.
-  (try
-    (let [chart (analytical-fitness-chart ind dataset)]
-      (if (and (analytical-genome-valid? ind)
-               (coords/analytical-exprs-present? ind chart))
-        (let [{:keys [data]} dataset
-              D    (char-scale data)
-              fns  (compile-analytical-fns ind chart)
-              ds   (assoc dataset :chart chart)
-              errors (horizon-errors-analytical fns ds (short-horizon-times data))]
-          (fitness-from-errors errors D))
-        0.0))
-    (catch Exception _ 0.0)))
+  (calculate-analytical-fitness-at-horizon ind dataset 0.08))
+
+(defn adversarial-repair-target
+  "For an analytical individual, return the weakest scenario and expression slot to patch.
+   {:dataset :expr-key :scenario-fitness :mse-q :mse-p :scenario-id}"
+  [ind datasets]
+  (let [leg (first-law-legacy ind)]
+    (when (= :analytical (:strategy leg))
+      (let [applicable (filterv #(domain-applicable? leg %) datasets)]
+        (when (seq applicable)
+          (let [{:keys [dataset scenario-fitness]}
+                (apply min-key :scenario-fitness
+                       (mapv (fn [ds]
+                               {:dataset ds
+                                :scenario-fitness
+                                (calculate-analytical-fitness-at-horizon
+                                 leg ds repair-horizon-frac)})
+                             applicable))
+                metrics (evaluate-predictions leg dataset)
+                finite? (fn [x] (and (number? x) (Double/isFinite x) (pos? x)))
+                mse-q (:mse-q metrics)
+                mse-p (:mse-p metrics)
+                expr-key (cond
+                           (and (finite? mse-q) (finite? mse-p))
+                           (if (>= mse-q mse-p)
+                             (rand-nth [:qx-expr :qy-expr])
+                             (rand-nth [:px-expr :py-expr]))
+                           (finite? mse-q) (rand-nth [:qx-expr :qy-expr])
+                           (finite? mse-p) (rand-nth [:px-expr :py-expr])
+                           :else (rand-nth analytical-expr-keys))]
+            {:dataset dataset
+             :expr-key expr-key
+             :scenario-fitness scenario-fitness
+             :mse-q mse-q
+             :mse-p mse-p
+             :scenario-id (:id (:scenario dataset))}))))))
+
+(defn apply-analytical-repair
+  "Insert a repaired analytical law into an individual (re-wraps energy branches when needed)."
+  [ind repaired-leg]
+  (let [leg (if (and *both-regimes?* (not (analytical-strict-energy-branches? repaired-leg)))
+              (wrap-analytical-energy-branches repaired-leg)
+              repaired-leg)
+        law (law-from-legacy leg)]
+    (if (seq (:laws ind))
+      (assoc-in ind [:laws 0] law)
+      (law->legacy law))))
 
 (defn calculate-differential-fitness [ind dataset]
   (try
@@ -2310,17 +2457,63 @@
           (double (nth sorted idx)))
         (throw (ex-info "Unknown fitness aggregate" {:aggregate aggregate}))))))
 
+(defn- calculate-analytical-slice-fitness-at-horizon
+  "Fitness for a regime-sliced law (arms only, no outer e/if) on one scenario."
+  [ind dataset horizon-frac]
+  (try
+    (let [chart (analytical-fitness-chart ind dataset)]
+      (if-not (analytical-slice-valid? ind chart)
+        0.0
+        (if-not (coords/analytical-exprs-present? ind chart)
+          0.0
+          (let [{:keys [data]} dataset
+                D    (char-scale data)
+                fns  (compile-analytical-fns ind chart)
+                ds   (assoc dataset :chart chart)
+                errors (horizon-errors-analytical fns ds (short-horizon-times data horizon-frac))]
+            (fitness-from-errors errors D)))))
+    (catch Exception _ 0.0)))
+
+(defn- calculate-analytical-per-regime-fitness-at-horizon
+  "Both-regimes: bound arms on bound scenarios, unbound arms on unbound; fitness = min(regimes)."
+  [ind datasets horizon-frac & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
+  (let [bound-ds   (filterv #(= :bound (dataset-regime-for-fitness %)) datasets)
+        unbound-ds (filterv #(= :unbound (dataset-regime-for-fitness %)) datasets)
+        bound-ind  (analytical-law-regime-slice ind :bound)
+        unbound-ind (analytical-law-regime-slice ind :unbound)
+        bound-fit  (when (seq bound-ds)
+                     (aggregate-scenario-fitness
+                      (mapv #(calculate-analytical-slice-fitness-at-horizon
+                              bound-ind % horizon-frac)
+                            bound-ds)
+                      :aggregate aggregate :percentile percentile))
+        unbound-fit (when (seq unbound-ds)
+                      (aggregate-scenario-fitness
+                       (mapv #(calculate-analytical-slice-fitness-at-horizon
+                               unbound-ind % horizon-frac)
+                             unbound-ds)
+                       :aggregate aggregate :percentile percentile))
+        regime-fits (vec (remove nil? [bound-fit unbound-fit]))]
+    (if (seq regime-fits)
+      (aggregate-scenario-fitness regime-fits :aggregate :min)
+      0.0)))
+
 (defn- calculate-analytical-de-driven-fitness
   "DE-driven analytical: short-horizon trajectory fit on integrated reference orbits
-   (same as data-driven analytical — not ODE residual on random phase probes)."
+   (same as data-driven analytical — not ODE residual on random phase probes).
+   With both-regimes strict branches: bound arms on bound scenarios, unbound on unbound."
   [ind datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
   (try
     (when (and (seq datasets) (analytical-genome-valid? ind))
-      (let [datasets (datasets-for-analytical-law ind datasets)
-            fits     (mapv (fn [ds] (calculate-analytical-fitness ind ds)) datasets)]
-        (if (seq datasets)
-          (aggregate-scenario-fitness fits :aggregate aggregate :percentile percentile)
-          0.0)))
+      (let [datasets (datasets-for-analytical-law ind datasets)]
+        (if (empty? datasets)
+          0.0
+          (if (per-regime-arm-fitness? ind)
+            (calculate-analytical-per-regime-fitness-at-horizon
+             ind datasets 0.08 :aggregate aggregate :percentile percentile)
+            (aggregate-scenario-fitness
+             (mapv (fn [ds] (calculate-analytical-fitness ind ds)) datasets)
+             :aggregate aggregate :percentile percentile)))))
     (catch Exception _ nil)))
 
 (defn- calculate-de-driven-fitness
@@ -2879,14 +3072,46 @@
 
 (declare fast-mutate-law fast-crossover-single-laws)
 
+(defn- mutate-analytical-gp [ind]
+  (if (and *guess-mutations?* (< (rand) 0.45))
+    (guess-mutate-individual ind)
+    (random-block-mutate-individual ind)))
+
+(defn- mcts-mutate-roll? []
+  (and *mcts-mutate?*
+       (seq *mcts-mutate-datasets*)
+       (pos? (long *mcts-mutate-simulations*))
+       (< (rand) (double *mcts-mutate-rate*))))
+
+(defn- try-mcts-mutate-analytical [ind]
+  (try
+    (let [search-fn (requiring-resolve 'evophy.mcts/search-repair-individual)
+          stats-fn  (requiring-resolve 'evophy.mcts/last-search-result)
+          _repaired (search-fn ind (vec *mcts-mutate-datasets*)
+                                *mcts-mutate-simulations*
+                                :quiet? true)]
+      (when (:improved? (stats-fn))
+        (:individual (stats-fn))))
+    (catch Throwable _ nil)))
+
+(defn- mutate-analytical-individual [ind]
+  (if (mcts-mutate-roll?)
+    (or (try-mcts-mutate-analytical ind) (mutate-analytical-gp ind))
+    (mutate-analytical-gp ind)))
+
 (defn- mutate-law [law]
   (mutate-analytical-domain
    (law-from-legacy
-    (if *fast-breeding?*
-      (fast-mutate-law (law->legacy law))
-      (if (and *guess-mutations?* (< (rand) 0.45))
-        (guess-mutate-individual (law->legacy law))
-        (random-block-mutate-individual (law->legacy law)))))))
+    (cond
+      *fast-breeding?* (fast-mutate-law (law->legacy law))
+
+      (= :analytical (law-kind law))
+      (mutate-analytical-individual (law->legacy law))
+
+      (and *guess-mutations?* (< (rand) 0.45))
+      (guess-mutate-individual (law->legacy law))
+
+      :else (random-block-mutate-individual (law->legacy law))))))
 
 (defn mutate-individual [ind]
   (let [restart-p (if *stagnation-escape?* 0.4 0.2)]
@@ -2897,6 +3122,8 @@
             (assoc ind :laws (assoc (vec (:laws ind)) i
                                     (mutate-law (nth (:laws ind) i)))))
           *fast-breeding?* (individual-with-law ind (fast-mutate-law (first-law-legacy ind)))
+          (= :analytical (primary-strategy-label ind))
+          (individual-with-law ind (mutate-analytical-individual (first-law-legacy ind)))
           (and *guess-mutations?* (< (rand) 0.45)) (guess-mutate-individual ind)
           :else (random-block-mutate-individual ind))
         validate-and-repair)))
@@ -3176,6 +3403,8 @@
 
 (def default-mcts-simulations 64)
 (def default-mcts-inject 5)
+(def default-mcts-repair-simulations 48)
+(def default-mcts-repair-inject 1)
 
 (defn parse-args
   [args]
@@ -3187,6 +3416,12 @@
                :mcts-simulations default-mcts-simulations
                :mcts-until-stop false
                :mcts-inject default-mcts-inject
+               :mcts-repair? true
+               :mcts-repair-simulations default-mcts-repair-simulations
+               :mcts-repair-inject default-mcts-repair-inject
+               :mcts-mutate? true
+               :mcts-mutate-rate default-mcts-mutate-rate
+               :mcts-mutate-simulations default-mcts-mutate-simulations
                :mcts? true
                :prompt-each-generation false
                :fitness-mode :random
@@ -3215,6 +3450,10 @@
           "--fresh" (recur (assoc opts :fresh? true) more)
           "--seed"  (recur (assoc opts :seed? true) more)
           "--no-mcts" (recur (assoc opts :mcts? false) more)
+          "--no-mcts-repair" (recur (assoc opts :mcts-repair? false) more)
+          "--mcts-repair" (recur (assoc opts :mcts-repair? true) more)
+          "--no-mcts-mutate" (recur (assoc opts :mcts-mutate? false) more)
+          "--mcts-mutate" (recur (assoc opts :mcts-mutate? true) more)
           "--mcts-until-stop" (recur (assoc opts :mcts-until-stop true) more)
           "--prompt-each-generation" (recur (assoc opts :prompt-each-generation true) more)
           "--fixed-scenarios" (recur (assoc opts :fitness-mode :fixed) more)
@@ -3229,6 +3468,10 @@
           "--no-guess" (recur (assoc opts :guess-mutations? false) more)
           "--mcts-simulations" (recur (assoc opts :mcts-simulations (Long/parseLong (first more))) (rest more))
           "--mcts-inject" (recur (assoc opts :mcts-inject (Long/parseLong (first more))) (rest more))
+          "--mcts-repair-simulations" (recur (assoc opts :mcts-repair-simulations (Long/parseLong (first more))) (rest more))
+          "--mcts-repair-inject" (recur (assoc opts :mcts-repair-inject (Long/parseLong (first more))) (rest more))
+          "--mcts-mutate-rate" (recur (assoc opts :mcts-mutate-rate (Double/parseDouble (first more))) (rest more))
+          "--mcts-mutate-simulations" (recur (assoc opts :mcts-mutate-simulations (Long/parseLong (first more))) (rest more))
           "--population" (recur (assoc opts :path (first more)) (rest more))
           "--generations" (recur (assoc opts :generations (Long/parseLong (first more))) (rest more))
           "--population-size" (recur (assoc opts :population-size (Long/parseLong (first more))) (rest more))
@@ -3252,9 +3495,9 @@
 (defn evolve-generation
   [population fitness-ctx population-size generation-index
    & {:keys [extra-immigrants elite-divisor behavior-probes behavior-diverse-elites?
-             behavior-cache score-progress? gen-label]
+             behavior-cache score-progress? gen-label repair-immigrants]
       :or {extra-immigrants 0 elite-divisor 5 behavior-diverse-elites? false
-           score-progress? false}}]
+           score-progress? false repair-immigrants []}}]
   (let [evaluation  (:evaluation fitness-ctx :data-driven)
         de-driven? (= evaluation :de-driven)
         datasets    (if de-driven?
@@ -3313,29 +3556,35 @@
                           (println (format "    %s mutating %d slots..."
                                            (or gen-label "gen") breed-slots))
                           (flush))
-                        (take breed-slots
-                              (mapcat (fn [parent]
-                                        (cons parent
-                                              (take (dec branch)
-                                                    (repeatedly
-                                                     #(if-let [other (when (and (> (count unique-elites) 1)
-                                                                                 (< (rand) 0.7))
-                                                                            (pick-other-elite parent unique-elites))]
-                                                        (or (crossover-individuals parent other)
-                                                            (mutate-individual parent))
-                                                        (mutate-individual parent))))))
-                                      unique-elites)))]
+                        (binding [*mcts-mutate-datasets* (when *mcts-mutate?* datasets)]
+                          (take breed-slots
+                                (mapcat (fn [parent]
+                                          (cons parent
+                                                (take (dec branch)
+                                                      (repeatedly
+                                                       #(if-let [other (when (and (> (count unique-elites) 1)
+                                                                                   (< (rand) 0.7))
+                                                                              (pick-other-elite parent unique-elites))]
+                                                          (or (crossover-individuals parent other)
+                                                              (mutate-individual parent))
+                                                          (mutate-individual parent))))))
+                                        unique-elites))))
+        repairs     (vec (take immigrant-n repair-immigrants))
+        random-n    (max 0 (- immigrant-n (count repairs)))]
     (vec (take population-size
                (concat
                 bred
+                repairs
                 (do
-                  (when score-progress?
-                    (println (format "    %s immigrants (%d)..."
-                                     (or gen-label "gen") immigrant-n))
+                  (when (or score-progress? (seq repairs))
+                    (println (format "    %s immigrants (%d%s)..."
+                                     (or gen-label "gen") immigrant-n
+                                     (when (seq repairs)
+                                       (str ", " (count repairs) " MCTS repair"))))
                     (flush))
                   (binding [*fast-immigrants?* (or *fast-immigrants?* (> extra-immigrants 5))
                             *preferred-law-chart* (coords/dominant-chart datasets)]
-                    (repeatedly immigrant-n random-individual))))))))
+                    (repeatedly random-n random-individual))))))))
 
 (defn- prompt-continue-evolution? []
   (print "  Enter = next generation, q = stop and save: ")
@@ -3346,11 +3595,15 @@
   (timbre/merge-config! {:min-level :warn})
   (let [{:keys [fresh? seed? path generations population-size prompt-each-generation
                 fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile
-                strategy guess-mutations? both-regimes? domain-filter?]}
+                strategy guess-mutations? both-regimes? domain-filter?
+                mcts-repair? mcts-repair-simulations mcts-repair-inject
+                mcts-mutate? mcts-mutate-rate mcts-mutate-simulations]}
         (parse-args args)
         de-driven? (= :de-driven (:evaluation fitness-context))
         both-regimes-on? (or both-regimes?
                              (and de-driven? (= strategy :analytical) (not domain-filter?)))
+        mcts-repair-on? (and mcts-repair? de-driven? (= strategy :analytical))
+        mcts-mutate-on? (and mcts-mutate? de-driven? (= strategy :analytical))
         report-scenarios default-scenarios
         ref-datasets (scenarios->datasets report-scenarios)
         preferred-chart (coords/dominant-chart ref-datasets)]
@@ -3358,6 +3611,9 @@
             *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)
             *de-driven-search?* de-driven?
             *both-regimes?* both-regimes-on?
+            *mcts-mutate?* mcts-mutate-on?
+            *mcts-mutate-rate* mcts-mutate-rate
+            *mcts-mutate-simulations* mcts-mutate-simulations
             *preferred-law-chart* preferred-chart]
   (when (and de-driven? (= strategy :differential))
     (println "warning: --strategy differential with --de-driven scores 0 (DE is already known)"))
@@ -3366,10 +3622,16 @@
      (if (= strategy :analytical)
        (str "Each individual: analytical laws only (short-horizon orbit fit)"
             (when both-regimes-on?
-              "; both regimes (all scenarios, require e/if on energy)"))
+              "; both regimes (per-regime arm fitness, strict e/if on energy)"))
        (if (= strategy :conserved)
          "Each individual: analytical laws + conserved laws (composite; min fitness)"
          "Each individual: analytical laws (motion DE) + conserved laws (invariants along orbits, not DE solutions)"))))
+  (when (and mcts-repair-on? de-driven? (= strategy :analytical))
+    (println (str "MCTS adversarial repair: up to " mcts-repair-inject
+                  " immigrant(s)/gen, " mcts-repair-simulations " sims each")))
+  (when (and mcts-mutate-on? de-driven? (= strategy :analytical))
+    (println (str "MCTS mutation: " (int (* 100 mcts-mutate-rate))
+                  "% of analytical mutates, " mcts-mutate-simulations " sims each")))
   (let [{:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
                                      :seed?  seed?
@@ -3459,6 +3721,22 @@
                                                   (into kept (repeatedly n-fresh random-individual)))
 
                                                 :else pop-with-hof))
+                           repair-n (when mcts-repair-on?
+                                      (cond
+                                        escape-deep? 0
+                                        escape-burst? (max mcts-repair-inject 3)
+                                        escape? (max mcts-repair-inject 2)
+                                        stagnating? mcts-repair-inject
+                                        :else mcts-repair-inject))
+                           repair-source (when (and repair-n @hall-of-fame)
+                                           (:ind @hall-of-fame))
+                           repair-immigrants (when (and repair-n repair-source)
+                                               (try
+                                                 ((requiring-resolve 'evophy.mcts/generation-repair-inject)
+                                                  repair-source ref-datasets mcts-repair-simulations repair-n)
+                                                 (catch Throwable e
+                                                   (println "  warning: MCTS repair failed:" (.getMessage e))
+                                                   [])))
                            pop' (binding [*stagnation-escape?* (or escape-burst? escape-deep?)
                                           *fast-breeding?* (or escape-burst? escape-deep?)
                                           *fast-immigrants?* (or escape-burst? escape-deep?)
@@ -3471,6 +3749,7 @@
                                                      :behavior-diverse-elites? false
                                                      :behavior-cache behavior-cache
                                                      :score-progress? (or escape-burst? escape-deep?)
+                                                     :repair-immigrants (or repair-immigrants [])
                                                      :gen-label (format "gen %d" (inc gen-idx))))
                            gens (+ generations-run (inc gen-idx))
                            {:keys [best mean median]} (population-fitness-stats pop')
@@ -3577,7 +3856,9 @@
             :analytical
             (do
               (when (analytical-branches-on-energy? law)
-                (println "    regime:branched (e/if neg? energy)"))
+                (println (if (analytical-strict-energy-branches? law)
+                             "    regime:strict (every slot e/if neg? energy)"
+                             "    regime:partial (e/if neg? energy in some slots)")))
               (when (and (not both-regimes-on?)
                          (not= (analytical-law-domain law) :any)
                          (not (analytical-branches-on-energy? law)))
@@ -3604,6 +3885,8 @@
                           " " (name (:strategy metrics))
                           (when (= (:strategy metrics) :analytical)
                             (cond
+                              (analytical-strict-energy-branches? (law->legacy law))
+                              " regime=per-arm"
                               (analytical-branches-on-energy? (law->legacy law))
                               " regime=branched"
                               both-regimes-on?
