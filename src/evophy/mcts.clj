@@ -323,7 +323,9 @@
     (into {:phase phase :repair-key expr-key}
           (map (fn [k]
                  [k (if (= k expr-key)
-                      hole
+                      (if (core/template-unbound-arms-active?)
+                        (list 'e/if '(neg? energy) hole (core/unbound-arm-expr k))
+                        hole)
                       (core/normalize-expr (get leg k)))])
                core/analytical-expr-keys))))
 
@@ -359,12 +361,22 @@
                    (get state expr-key))]
       (assoc state expr-key expr))))
 
-(defn- wrap-repaired-slot-expr [expr]
+(defn- wrap-repaired-slot-expr [expr expr-key]
   (let [ex (core/normalize-expr expr)]
-    (if (and (sequential? ex)
-             (= 'e/if (first ex))
-             (= '(neg? energy) (second ex)))
+    (cond
+      (core/template-unbound-arms-active?)
+      (if (and (sequential? ex)
+               (= 'e/if (first ex))
+               (= '(neg? energy) (second ex)))
+        (core/slot-with-bound-arm expr-key (nth (vec (rest ex)) 1))
+        (core/slot-with-bound-arm expr-key ex))
+
+      (and (sequential? ex)
+           (= 'e/if (first ex))
+           (= '(neg? energy) (second ex)))
       ex
+
+      :else
       (list 'e/if '(neg? energy) ex ex))))
 
 (defn- repair-state->individual [state base-ind]
@@ -375,7 +387,7 @@
                               (let [ex (core/normalize-expr (get state k))]
                                 [k (if (= k repair-key)
                                      (if core/*both-regimes?*
-                                       (wrap-repaired-slot-expr ex)
+                                       (wrap-repaired-slot-expr ex repair-key)
                                        ex)
                                      ex)]))
                             core/analytical-expr-keys))

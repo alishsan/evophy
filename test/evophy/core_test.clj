@@ -450,3 +450,44 @@
         (is (pos? junk-fit))
         (is (pos? clean-fit))
         (is (< junk-fit clean-fit))))))
+
+(deftest template-unbound-arms-locks-taylor
+  (let [branch (fn [ex] (list 'e/if '(neg? energy) ex '(+ q0x 999.0 t)))
+        taylor {:strategy :analytical :domain :any
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        branched (into taylor
+                       (map (fn [[k ex]] [k (branch ex)])
+                            (select-keys taylor [:qx-expr :qy-expr :px-expr :py-expr])))]
+    (binding [*both-regimes?* true *template-unbound-arms?* true]
+      (let [fixed (template-unbound-arms-law branched)
+            unbound (analytical-law-regime-slice fixed :unbound)]
+        (is (analytical-strict-energy-branches? fixed))
+        (is (= (unbound-arm-expr :qx-expr) (:qx-expr unbound)))
+        (is (= (unbound-arm-expr :px-expr) (:px-expr unbound)))))))
+
+(deftest pair-mutate-preserves-taylor-unbound
+  (let [datasets (scenarios->datasets (take 2 default-scenarios))
+        branch (fn [ex] (list 'e/if '(neg? energy) ex ex))
+        taylor {:strategy :analytical :domain :any
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        parent (into taylor
+                     (map (fn [[k ex]] [k (branch ex)])
+                          (select-keys taylor [:qx-expr :qy-expr :px-expr :py-expr])))]
+    (binding [*both-regimes?* true
+              *template-unbound-arms?* true
+              *guess-mutations?* false
+              *stagnation-escape?* false
+              *mcts-mutate?* false]
+      (with-redefs [rand (constantly 0.99)]
+        (let [child (mutate-individual parent)
+              unbound (analytical-law-regime-slice (first-law-legacy child) :unbound)]
+          (is (genome-valid? child))
+          (is (analytical-strict-energy-branches? child))
+          (is (= (unbound-arm-expr :qx-expr) (:qx-expr unbound)))
+          (is (= (unbound-arm-expr :py-expr) (:py-expr unbound))))))))

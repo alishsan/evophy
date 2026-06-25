@@ -52,6 +52,8 @@ Use `--fresh` after checkpoint format changes or when you want a clean populatio
 | `--no-mcts-mutate` | Disable MCTS slot repair during analytical mutation |
 | `--mcts-mutate-rate R` | Fraction of analytical mutates that try MCTS repair (default 0.2) |
 | `--mcts-mutate-simulations N` | MCTS sims per mutation attempt (default 48) |
+| `--no-template-unbound` | Allow unbound arms to drift (disable Taylor template + pair mutations) |
+| `--no-analytical-blocks` | Disable Emmy-validated analytical block injection (circle, ellipse, Taylor, …) |
 | `--mcts-simulations N` | MCTS rollouts when using `evophy.mcts` (default 64) |
 | `--mcts-inject N` | (CLI only) |
 
@@ -72,7 +74,7 @@ Analytical validity can be declared two ways:
 1. **`:domain` tag** — `:bound` (\(E<0\)), `:unbound` (\(E>0\)), or `:any` (legacy). Fitness and MSE run only on scenarios in that regime; mismatches are **n/a**, not penalized. Use `--domain-filter` with `--de-driven --strategy analytical` to keep this mode.
 2. **`(e/if (neg? energy) bound-branch unbound-branch)`** inside expressions — scored on every scenario; `energy` is \(H(q_0,p_0)\) pre-bound at compile time.
 
-**Both regimes (default for `--de-driven --strategy analytical`):** fitness uses **all** reference scenarios; `:domain` tags are ignored; every analytical slot must be `(e/if (neg? energy) bound-arm unbound-arm)` with no bogus `e/if` tests. **Per-regime arm fitness:** bound arms are scored only on bound scenarios, unbound arms on unbound; overall fitness is `min(bound, unbound)`. Seeds are wrapped automatically. Opt out with `--domain-filter`.
+**Both regimes (default for `--de-driven --strategy analytical`):** fitness uses **all** reference scenarios; `:domain` tags are ignored; every analytical slot must be `(e/if (neg? energy) bound-arm unbound-arm)` with no bogus `e/if` tests. **Per-regime arm fitness:** bound arms are scored only on bound scenarios, unbound arms on unbound; overall fitness is `min(bound, unbound)`. **Template unbound (default):** unbound arms stay fixed to first-order Taylor; mutations co-evolve bound arms in `(qx,px)` and `(qy,py)` pairs. **Analytical blocks (default):** Emmy-validated catalog laws (circle, ellipse, Taylor, harmonic) inject via immigrants, guess mutations, and pair grafts. Opt out with `--no-template-unbound` or `--no-analytical-blocks`. Use `--domain-filter` for legacy domain-tagged mode.
 
 With `--de-driven`, analytical laws score short-horizon trajectory fit on integrated reference orbits; conserved laws score **temporal constancy along integrated orbits** (they are invariants, not solutions of the motion DE). Differential laws score 0 (the DE is already known).
 

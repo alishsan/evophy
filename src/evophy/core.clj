@@ -4,6 +4,7 @@
   (:require [clojure.edn :as edn]
             [clojure.walk :as walk]
             [emmy.env :as e]
+            [evophy.analytical-blocks :as blocks]
             [evophy.coords :as coords]
             [taoensso.timbre :as timbre]))
 
@@ -991,6 +992,67 @@
   "When true, analytical fitness/MSE use every scenario; genomes must branch on (neg? energy)."
   false)
 
+(def ^:dynamic *template-unbound-arms?*
+  "When true with both-regimes: lock unbound arms to Taylor; evolve bound arms via q/p pair mutations."
+  false)
+
+(def ^:dynamic *analytical-blocks?*
+  "When true, inject Emmy-validated analytical catalog blocks (circle, ellipse, Taylor, …)."
+  false)
+
+(def ^:private bound-arm-pairs
+  "Hamiltonian-coupled slot pairs for coordinated bound-arm mutation."
+  [[:qx-expr :px-expr] [:qy-expr :py-expr]])
+
+(defn unbound-arm-expr
+  "Taylor unbound arm for one analytical slot."
+  [expr-key]
+  (get unbound-linear-analytical-exprs expr-key))
+
+(defn slot-with-bound-arm
+  "Wrap bound-arm in (e/if (neg? energy) bound Taylor-unbound)."
+  [expr-key bound-expr]
+  (list 'e/if '(neg? energy) bound-expr (unbound-arm-expr expr-key)))
+
+(defn template-unbound-arms-law
+  "Re-lock every unbound arm to Taylor while preserving bound arms."
+  [leg]
+  (if (and *template-unbound-arms?* *both-regimes?* (= :analytical (:strategy leg)))
+    (into leg
+          (map (fn [k]
+                 (let [bound (regime-arm-expr (get leg k) :bound)]
+                   [k (slot-with-bound-arm k bound)]))
+               cartesian-analytical-expr-keys))
+    leg))
+
+(defn template-unbound-arms-active? []
+  (and *template-unbound-arms?* *both-regimes?*))
+
+(defn- analytical-blocks-active? []
+  (and *analytical-blocks?* *both-regimes?*))
+
+(defn- catalog-law-as-individual []
+  (let [leg (blocks/random-catalog-law)]
+    (if (and *both-regimes?* (template-unbound-arms-active?))
+      (template-unbound-arms-law
+       (into leg
+             (map (fn [k] [k (slot-with-bound-arm k (get leg k))])
+                  cartesian-analytical-expr-keys)))
+      (if *both-regimes?*
+        (wrap-analytical-energy-branches leg)
+        leg))))
+
+(defn- apply-catalog-pair-to-law [leg]
+  (let [entry (blocks/random-catalog-entry)
+        pair  (rand-nth (blocks/bound-pairs))
+        grafted (blocks/graft-bound-pair leg entry pair)]
+    (if (template-unbound-arms-active?)
+      (into grafted
+            (map (fn [slot]
+                   [slot (slot-with-bound-arm slot (get grafted slot))])
+                 pair))
+      grafted)))
+
 (defn- per-regime-arm-fitness? [ind]
   (and *both-regimes?* (analytical-strict-energy-branches? ind)))
 
@@ -1634,7 +1696,9 @@
 (defn random-analytical-individual
   ([] (random-analytical-individual (or *preferred-law-chart* :cartesian)))
   ([chart]
-   (let [chart    (keyword chart)
+   (if (and (analytical-blocks-active?) (= chart :cartesian) (< (rand) 0.45))
+     (catalog-law-as-individual)
+     (let [chart    (keyword chart)
          keys     (coords/analytical-expr-keys-for-chart chart)
          vars     (vec (concat '[t]
                                (coords/ic-vars-for-chart chart)
@@ -1654,8 +1718,14 @@
                   :domain (if *both-regimes?* :any
                               (if (< (rand) 0.35) (rand-nth [:bound :unbound]) :any))}
                  (map (fn [k]
-                        [k (if (or *both-regimes?* (< (rand) 0.22))
+                        [k (cond
+                             (and *both-regimes?* (template-unbound-arms-active?))
+                             (slot-with-bound-arm k (random-expression 4 vars))
+
+                             (or *both-regimes?* (< (rand) 0.22))
                              (random-regime-branch-expr 3 vars)
+
+                             :else
                              (random-expression 4 vars))])
                       keys))
            (ensure-symbol-coverage keys required)
@@ -1663,7 +1733,7 @@
            (cond-> (= chart :polar) ensure-t))
       keys
       required
-      analytical-genome-valid?))))
+      analytical-genome-valid?)))))
 
 (defn random-differential-individual []
   (random-valid-individual
@@ -2283,10 +2353,13 @@
     :c-expr '(e/div (+ (* px px) (* py py)) (* 2.0 m))}])
 
 (defn- both-regimes-analytical-seeds []
-  (mapv #(if (analytical-branches-on-energy? %)
-           %
-           (wrap-analytical-energy-branches %))
-        (filterv #(= (:strategy %) :analytical) physics-seeds)))
+  (mapv #(-> %
+               (cond-> (not (analytical-branches-on-energy? %))
+                 (wrap-analytical-energy-branches))
+               template-unbound-arms-law)
+        (into (vec (filterv #(= (:strategy %) :analytical) physics-seeds))
+              (when *analytical-blocks?*
+                (blocks/catalog-laws)))))
 
 (def de-driven-composite-seeds
   "Bundled analytical q(t),p(t) + Hamiltonian energy — one individual, two laws."
@@ -2402,7 +2475,7 @@
   (let [leg (if (and *both-regimes?* (not (analytical-strict-energy-branches? repaired-leg)))
               (wrap-analytical-energy-branches repaired-leg)
               repaired-leg)
-        law (law-from-legacy leg)]
+        law (law-from-legacy (template-unbound-arms-law leg))]
     (if (seq (:laws ind))
       (assoc-in ind [:laws 0] law)
       (law->legacy law))))
@@ -2978,10 +3051,15 @@
     (distinct (filter some? @cands))))
 
 (defn- slot-guess-candidates [slot block-repr]
-  (case slot
-    :c-expr (conserved-guess-candidates block-repr)
-    (:dqx-expr :dqy-expr :dpx-expr :dpy-expr) (differential-guess-candidates block-repr)
-    []))
+  (let [catalog-cands
+        (when (analytical-blocks-active?)
+          (vec (for [entry (blocks/entries-for-slot slot)]
+                 (decompose-expr-to-blocks (blocks/slot-expr entry slot)))))]
+    (into (or catalog-cands [])
+          (case slot
+            :c-expr (conserved-guess-candidates block-repr)
+            (:dqx-expr :dqy-expr :dpx-expr :dpy-expr) (differential-guess-candidates block-repr)
+            []))))
 
 (defn guess-mutate-individual
   "Apply one symbolically guessed block edit (hypothesis mutation), not a random tree walk."
@@ -3052,7 +3130,7 @@
                                    (random-conserved-individual))
                    ind')
         ind''  (if *fast-breeding?* repaired (sync-block-genome repaired))]
-    ind''))
+    (template-unbound-arms-law ind'')))
 
 (defn- validate-and-repair
   "Simplify, detect degenerate (constant) sub-expressions, and ensure required
@@ -3062,6 +3140,38 @@
     (laws-individual (mapv #(law-from-legacy (validate-and-repair-law (law->legacy %)))
                             (:laws ind)))
     (validate-and-repair-law ind)))
+
+(defn- mutate-bound-arm-at-slot [ind k]
+  (let [bound (regime-arm-expr (normalize-expr (get ind k)) :bound)
+        mutated (mutate bound analytical-vars)]
+    (assoc ind k (slot-with-bound-arm k mutated))))
+
+(defn- guess-mutate-bound-arm [ind k]
+  (let [bound (regime-arm-expr (normalize-expr (get ind k)) :bound)
+        temp  (-> ind
+                  (assoc k bound)
+                  sync-block-genome)
+        blks  (get-in temp [:expr-blocks k])
+        cands (seq (slot-guess-candidates k blks))]
+    (if cands
+      (let [pick (rand-nth cands)
+            synced (sync-block-genome (assoc-in temp [:expr-blocks k] pick) :from-blocks? true)]
+        (assoc ind k (slot-with-bound-arm k (get synced k))))
+      ind)))
+
+(defn- mutate-bound-slot [ind k]
+  (if (and *guess-mutations?* (< (rand) 0.45))
+    (let [g (guess-mutate-bound-arm ind k)]
+      (if (not= g ind) g (mutate-bound-arm-at-slot ind k)))
+    (mutate-bound-arm-at-slot ind k)))
+
+(defn- pair-mutate-analytical-individual [ind]
+  (let [pair (rand-nth bound-arm-pairs)]
+    (-> (if (and (analytical-blocks-active?) (< (rand) 0.3))
+          (apply-catalog-pair-to-law ind)
+          (reduce mutate-bound-slot ind pair))
+        template-unbound-arms-law
+        validate-and-repair-law)))
 
 (defn- mutate-analytical-domain [law]
   (if (or *both-regimes?* (not= (law-kind law) :analytical))
@@ -3080,7 +3190,10 @@
 (defn gp-mutate-analytical
   "One GP edit on an analytical law (legacy map); no restart or MCTS."
   [ind]
-  (validate-and-repair-law (mutate-analytical-gp ind)))
+  (validate-and-repair-law
+   (if (template-unbound-arms-active?)
+     (pair-mutate-analytical-individual ind)
+     (mutate-analytical-gp ind))))
 
 (defn- mcts-mutate-roll? []
   (and *mcts-mutate?*
@@ -3100,9 +3213,18 @@
     (catch Throwable _ nil)))
 
 (defn- mutate-analytical-individual [ind]
-  (if (mcts-mutate-roll?)
-    (or (try-mcts-mutate-analytical ind) (mutate-analytical-gp ind))
-    (mutate-analytical-gp ind)))
+  (let [ind (template-unbound-arms-law ind)]
+    (cond
+      (mcts-mutate-roll?)
+      (or (try-mcts-mutate-analytical ind)
+          (if (template-unbound-arms-active?)
+            (pair-mutate-analytical-individual ind)
+            (mutate-analytical-gp ind)))
+
+      (template-unbound-arms-active?)
+      (pair-mutate-analytical-individual ind)
+
+      :else (mutate-analytical-gp ind))))
 
 (defn- mutate-law [law]
   (mutate-analytical-domain
@@ -3427,6 +3549,8 @@
                :mcts-mutate? true
                :mcts-mutate-rate default-mcts-mutate-rate
                :mcts-mutate-simulations default-mcts-mutate-simulations
+               :template-unbound-arms? true
+               :analytical-blocks? true
                :mcts? true
                :prompt-each-generation false
                :fitness-mode :random
@@ -3459,6 +3583,10 @@
           "--mcts-repair" (recur (assoc opts :mcts-repair? true) more)
           "--no-mcts-mutate" (recur (assoc opts :mcts-mutate? false) more)
           "--mcts-mutate" (recur (assoc opts :mcts-mutate? true) more)
+          "--no-template-unbound" (recur (assoc opts :template-unbound-arms? false) more)
+          "--template-unbound" (recur (assoc opts :template-unbound-arms? true) more)
+          "--no-analytical-blocks" (recur (assoc opts :analytical-blocks? false) more)
+          "--analytical-blocks" (recur (assoc opts :analytical-blocks? true) more)
           "--mcts-until-stop" (recur (assoc opts :mcts-until-stop true) more)
           "--prompt-each-generation" (recur (assoc opts :prompt-each-generation true) more)
           "--fixed-scenarios" (recur (assoc opts :fitness-mode :fixed) more)
@@ -3603,13 +3731,19 @@
                 fitness-context fitness-mode scenario-samples fitness-aggregate fitness-percentile
                 strategy guess-mutations? both-regimes? domain-filter?
                 mcts-repair? mcts-repair-simulations mcts-repair-inject
-                mcts-mutate? mcts-mutate-rate mcts-mutate-simulations]}
+                mcts-mutate? mcts-mutate-rate mcts-mutate-simulations
+                template-unbound-arms?
+                analytical-blocks?]}
         (parse-args args)
         de-driven? (= :de-driven (:evaluation fitness-context))
         both-regimes-on? (or both-regimes?
                              (and de-driven? (= strategy :analytical) (not domain-filter?)))
         mcts-repair-on? (and mcts-repair? de-driven? (= strategy :analytical))
         mcts-mutate-on? (and mcts-mutate? de-driven? (= strategy :analytical))
+        template-unbound-on? (and template-unbound-arms? both-regimes-on?
+                                  de-driven? (= strategy :analytical))
+        analytical-blocks-on? (and analytical-blocks? both-regimes-on?
+                                   de-driven? (= strategy :analytical))
         report-scenarios default-scenarios
         ref-datasets (scenarios->datasets report-scenarios)
         preferred-chart (coords/dominant-chart ref-datasets)]
@@ -3617,6 +3751,8 @@
             *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)
             *de-driven-search?* de-driven?
             *both-regimes?* both-regimes-on?
+            *template-unbound-arms?* template-unbound-on?
+            *analytical-blocks?* analytical-blocks-on?
             *mcts-mutate?* mcts-mutate-on?
             *mcts-mutate-rate* mcts-mutate-rate
             *mcts-mutate-simulations* mcts-mutate-simulations
@@ -3628,7 +3764,9 @@
      (if (= strategy :analytical)
        (str "Each individual: analytical laws only (short-horizon orbit fit)"
             (when both-regimes-on?
-              "; both regimes (per-regime arm fitness, strict e/if on energy)"))
+              (str "; both regimes (per-regime arm fitness, strict e/if on energy)"
+                   (when template-unbound-on?
+                     ", Taylor unbound template + q/p pair mutations"))))
        (if (= strategy :conserved)
          "Each individual: analytical laws + conserved laws (composite; min fitness)"
          "Each individual: analytical laws (motion DE) + conserved laws (invariants along orbits, not DE solutions)"))))
@@ -3638,6 +3776,12 @@
   (when (and mcts-mutate-on? de-driven? (= strategy :analytical))
     (println (str "MCTS mutation: " (int (* 100 mcts-mutate-rate))
                   "% of analytical mutates, " mcts-mutate-simulations " sims each")))
+  (when template-unbound-on?
+    (println "Template unbound arms: Taylor locked; bound arms mutate in (qx,px)/(qy,py) pairs"))
+  (when analytical-blocks-on?
+    (println (str "Analytical blocks (Emmy-validated): "
+                  (blocks/catalog-block-count)
+                  " catalog laws — circle, ellipse, Taylor, harmonic")))
   (let [{:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
                                      :seed?  seed?
