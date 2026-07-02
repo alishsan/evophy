@@ -16,6 +16,8 @@
     (= op 'e/square) g/square
     (= op 'e/sin) g/sin
     (= op 'e/cos) g/cos
+    (= op 'e/sinh) g/sinh
+    (= op 'e/cosh) g/cosh
     (= op 'e/sqrt) g/sqrt
     (or (= op 'e/div) (= op 'e//)) g//
     :else nil))
@@ -55,6 +57,8 @@
         g/square (list 'e/square (emmy-expr->evophy* (first args)))
         g/sin (list 'e/sin (emmy-expr->evophy* (first args)))
         g/cos (list 'e/cos (emmy-expr->evophy* (first args)))
+        g/sinh (list 'e/sinh (emmy-expr->evophy* (first args)))
+        g/cosh (list 'e/cosh (emmy-expr->evophy* (first args)))
         g/sqrt (list 'e/sqrt (emmy-expr->evophy* (first args)))
         g// (list 'e/div (emmy-expr->evophy* (first args)) (emmy-expr->evophy* (second args)))
         (throw (ex-info "Unsupported Emmy op in round-trip" {:op op}))))

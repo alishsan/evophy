@@ -32,7 +32,7 @@ Use `--fresh` after checkpoint format changes or when you want a clean populatio
 |------|---------|
 | `--fresh` | Ignore checkpoint; new random population |
 | `--seed` | Inject physics seed individuals into the first generation |
-| `--de-driven` | Fitness from known physics: analytical short-horizon orbit fit + conserved invariance along orbits (not data-driven scenario matching) |
+| `--de-driven` | Fitness from known physics: analytical 20% + full-orbit fit + conserved invariance along orbits (not data-driven scenario matching) |
 | `--strategy NAME` | Restrict immigrants to `analytical`, `differential`, or `conserved` (default: mixed) |
 | `--generations N` | Generations this run (default 50) |
 | `--population-size N` | Population size (default 50) |
@@ -53,7 +53,7 @@ Use `--fresh` after checkpoint format changes or when you want a clean populatio
 | `--mcts-mutate-rate R` | Fraction of analytical mutates that try MCTS repair (default 0.2) |
 | `--mcts-mutate-simulations N` | MCTS sims per mutation attempt (default 48) |
 | `--no-template-unbound` | Allow unbound arms to drift (disable Taylor template + pair mutations) |
-| `--no-analytical-blocks` | Disable Emmy-validated analytical block injection (circle, ellipse, Taylor, …) |
+| `--no-analytical-blocks` | Disable Emmy-validated analytical block injection (circle, ellipse, harmonic, conic sinh/cosh, …) |
 | `--mcts-simulations N` | MCTS rollouts when using `evophy.mcts` (default 64) |
 | `--mcts-inject N` | (CLI only) |
 
@@ -66,7 +66,7 @@ Each individual holds one or more **laws** in `:laws`. Composite fitness is the 
 | Kind | Role | Fitness (data-driven) |
 |------|------|------------------------|
 | `:differential` | Rate laws \(\dot q_x, \dot q_y, \dot p_x, \dot p_y\) from current `(qx, qy, px, py, m, alpha)` | Symplectic one-step / rollout error |
-| `:analytical` | Trajectories \(q(t), p(t)\) from `(t, ICs, m, alpha)` | Short-horizon forecast error (matching **domain** or `e/if` branch) |
+| `:analytical` | Trajectories \(q(t), p(t)\) from `(t, ICs, m, alpha)` | Min fitness at **20%** and **full-orbit** horizons (matching **domain** or `e/if` branch) |
 | `:conserved` | Scalar invariant \(C(q,p,m,\alpha)\) | Low CoV along orbit **and** \(\nabla C \cdot f \approx 0\) |
 
 Analytical validity can be declared two ways:
@@ -74,9 +74,9 @@ Analytical validity can be declared two ways:
 1. **`:domain` tag** — `:bound` (\(E<0\)), `:unbound` (\(E>0\)), or `:any` (legacy). Fitness and MSE run only on scenarios in that regime; mismatches are **n/a**, not penalized. Use `--domain-filter` with `--de-driven --strategy analytical` to keep this mode.
 2. **`(e/if (neg? energy) bound-branch unbound-branch)`** inside expressions — scored on every scenario; `energy` is \(H(q_0,p_0)\) pre-bound at compile time.
 
-**Both regimes (default for `--de-driven --strategy analytical`):** fitness uses **all** reference scenarios; `:domain` tags are ignored; every analytical slot must be `(e/if (neg? energy) bound-arm unbound-arm)` with no bogus `e/if` tests. **Per-regime arm fitness:** bound arms are scored only on bound scenarios, unbound arms on unbound; overall fitness is `min(bound, unbound)`. **Template unbound (default):** unbound arms stay fixed to first-order Taylor; mutations co-evolve bound arms in `(qx,px)` and `(qy,py)` pairs. **Analytical blocks (default):** Emmy-validated catalog laws (circle, ellipse, Taylor, harmonic) inject via immigrants, guess mutations, and pair grafts. Opt out with `--no-template-unbound` or `--no-analytical-blocks`. Use `--domain-filter` for legacy domain-tagged mode.
+**Both regimes (default for `--de-driven --strategy analytical`):** fitness uses **all** reference scenarios; `:domain` tags are ignored; every analytical slot must be `(e/if (neg? energy) bound-arm unbound-arm)` with no bogus `e/if` tests. **Per-regime arm fitness:** bound arms are scored only on bound scenarios, unbound arms on unbound; overall fitness is `min(bound, unbound)`. **Template unbound (default):** with analytical blocks, unbound arms use **`:hyperbola-conic`** (`e/sinh`/`e/cosh` on `kepler-F`); otherwise Taylor. Bound arms co-evolve in `(qx,px)` and `(qy,py)` pairs. **`:kepler-conic` inject** (40% of catalog seeds): ellipse bound + hyperbola unbound in one law. Opt out with `--no-template-conic-unbound`. **Analytical blocks (default):** Emmy-validated catalog laws inject via immigrants, guess mutations, and pair grafts. Opt out with `--no-template-unbound` or `--no-analytical-blocks`. Use `--domain-filter` for legacy domain-tagged mode.
 
-With `--de-driven`, analytical laws score short-horizon trajectory fit on integrated reference orbits; conserved laws score **temporal constancy along integrated orbits** (they are invariants, not solutions of the motion DE). Differential laws score 0 (the DE is already known).
+With `--de-driven`, analytical laws score trajectory fit at **20% and full-orbit** horizons on integrated reference orbits (fitness = min of the two); conserved laws score **temporal constancy along integrated orbits** (they are invariants, not solutions of the motion DE). Differential laws score 0 (the DE is already known).
 
 Each scenario supplies its own `m` and `alpha` when evaluating fitness.
 

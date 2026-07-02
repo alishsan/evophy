@@ -190,8 +190,7 @@
 (defn- adversarial-fitness [ind adversarial-dataset all-datasets fit-opts]
   (let [leg (core/first-law-legacy ind)
         adv (when (and (= :analytical (:strategy leg)) adversarial-dataset)
-              (core/calculate-analytical-fitness-at-horizon
-               leg adversarial-dataset core/repair-horizon-frac))
+              (core/calculate-analytical-fitness-at-horizon leg adversarial-dataset))
         full (fitness-for-individual ind all-datasets fit-opts)]
     (if (and adv (pos? adv))
       (+ (* 0.75 adv) (* 0.25 full))
@@ -200,8 +199,7 @@
 (defn- repair-worst-scenario-fitness [ind dataset]
   (let [leg (core/first-law-legacy ind)]
     (if (and dataset (= :analytical (:strategy leg)))
-      (core/calculate-analytical-fitness-at-horizon
-       leg dataset core/repair-horizon-frac)
+      (core/calculate-analytical-fitness-at-horizon leg dataset)
       0.0)))
 
 (defn- score-state [state datasets]
@@ -474,9 +472,8 @@
             root-state (assoc (repair-state-from-individual base-ind expr-key)
                               :base-ind base-ind)
             _ (when (and scenario-id (not quiet?))
-                (println (format "  [MCTS repair] scenario=%s slot=%s horizon=%.0f%%"
-                                 (name scenario-id) (name expr-key)
-                                 (* 100.0 core/repair-horizon-frac))))
+                (println (format "  [MCTS repair] scenario=%s slot=%s horizons=20%%+100%%"
+                                 (name scenario-id) (name expr-key))))
             parent-repair-fit (repair-worst-scenario-fitness base-ind dataset)
             root (atom {:state root-state
                         :visits 0 :value-sum 0.0
@@ -513,15 +510,14 @@
                           " (repair fitness " (format "%.4f" (:repair-fitness @best))
                           " vs parent " (format "%.4f" parent-repair-fit) ")")))
           (when (and (not quiet?) (pos? ran) (not improved?))
-            (println (format "  [MCTS repair] no improvement on %.0f%% horizon (%.4f <= %.4f)"
-                             (* 100.0 core/repair-horizon-frac)
+            (println (format "  [MCTS repair] no improvement on 20%%+100%% horizons (%.4f <= %.4f)"
                              (:repair-fitness @best) parent-repair-fit)))
           result))
       base-ind)))
 
 (defn generation-repair-inject
   "Up to n adversarial repairs from one source individual (typically HoF).
-   Skips repairs that do not improve worst-scenario fitness at [[core/repair-horizon-frac]]."
+   Skips repairs that do not improve worst-scenario fitness at 20% + full-orbit horizons."
   [base-ind datasets max-simulations n]
   (loop [i 0 acc []]
     (if (or (>= i n) (stop-requested?))

@@ -22,6 +22,8 @@
            e/sqrt   (list 'real-sqrt (first args))
            e/sin    (list 'real-sin (first args))
            e/cos    (list 'real-cos (first args))
+           e/sinh   (list 'real-sinh (first args))
+           e/cosh   (list 'real-cosh (first args))
            e/square (list 'real-square (first args))
            e/div    (list 'real-div (first args) (second args))
            e//      (list 'real-div (first args) (second args))
@@ -73,6 +75,12 @@
                   e/cos
                   (let [[a] args]
                     (if (number? a) (Math/cos (double a)) (list 'e/cos a)))
+                  e/sinh
+                  (let [[a] args]
+                    (if (number? a) (Math/sinh (double a)) (list 'e/sinh a)))
+                  e/cosh
+                  (let [[a] args]
+                    (if (number? a) (Math/cosh (double a)) (list 'e/cosh a)))
                   e/sqrt
                   (let [[a] args]
                     (if (and (number? a) (not (neg? a)))
@@ -202,35 +210,36 @@
         F
         (recur (- F dF) (inc n))))))
 
-(defn- kepler-state-at-t
-  "Exact Keplerian (qx, qy, px, py) at time t via orbital elements.
-   Handles elliptic (E < 0) and hyperbolic (E > 0).
-   Returns nil for degenerate orbits (radial: |L| < 1e-8; near-parabolic: |e−1| < 1e-5)
-   so callers can fall back to numerical integration."
+(defn- kepler-orbit-nan []
+  {:qx Double/NaN :qy Double/NaN :px Double/NaN :py Double/NaN
+   :ecc Double/NaN :cos-om Double/NaN :sin-om Double/NaN
+   :semi-a Double/NaN :semi-b Double/NaN :bh Double/NaN :n-mean Double/NaN
+   :kepler-u Double/NaN :kepler-F Double/NaN
+   :kepler-xp Double/NaN :kepler-yp Double/NaN
+   :kepler-vxp Double/NaN :kepler-vyp Double/NaN})
+
+(defn- kepler-orbit-at-t
+  "Exact Kepler conic state plus orbital elements for analytical catalog laws.
+   Elliptic: x'=a(cos u−e), y'=b sin u.  Hyperbolic: x'=a(e−cosh F), y'=b_h sinh F."
   [m alpha q0x q0y p0x p0y t]
   (let [q0x   (double q0x) q0y (double q0y)
         p0x   (double p0x) p0y (double p0y)
         m     (double m)   alpha (double alpha) t (double t)
         r0    (Math/sqrt (+ (* q0x q0x) (* q0y q0y)))
-        L     (- (* q0x p0y) (* q0y p0x))         ; scalar angular momentum
+        L     (- (* q0x p0y) (* q0y p0x))
         E     (grav2d-energy m alpha {:qx q0x :qy q0y :px p0x :py p0y})
-        ;; Laplace-Runge-Lenz vector: e_vec = (p×L)/(mα) − r̂
-        ;; In 2D with L scalar: p×L = (py·L, −px·L)
         ex    (- (/ (* p0y L) (* m alpha)) (/ q0x r0))
         ey    (- (/ (* (- p0x) L) (* m alpha)) (/ q0y r0))
         e     (Math/sqrt (+ (* ex ex) (* ey ey)))]
-    (when (and (> (Math/abs L) 1e-8)
-               (> (Math/abs (- e 1.0)) 1e-5))
-      (let [omega  (Math/atan2 ey ex)          ; angle of periapsis from +x axis
+    (if (or (<= (Math/abs L) 1e-8)
+            (<= (Math/abs (- e 1.0)) 1e-5))
+      (kepler-orbit-nan)
+      (let [omega  (Math/atan2 ey ex)
             cos-om (Math/cos omega)
             sin-om (Math/sin omega)
-            ;; Rotate initial position into orbital frame (periapsis along +x')
             x0p    (+ (* q0x cos-om) (* q0y sin-om))
             y0p    (+ (* (- q0x) sin-om) (* q0y cos-om))]
         (if (neg? E)
-          ;; ── Elliptic orbit ──────────────────────────────────────────────
-          ;; Parameterisation: x'=a(cos u − e), y'=b·sin u, r=a(1−e·cos u)
-          ;; Time equation: M = u − e·sin u,  M = n(t−t₀), n = √(α/ma³)
           (let [a   (/ alpha (* -2.0 E))
                 b   (* a (Math/sqrt (max 0.0 (- 1.0 (* e e)))))
                 n   (Math/sqrt (/ alpha (* m a a a)))
@@ -240,22 +249,24 @@
                 cu  (Math/cos u) su (Math/sin u)
                 xp  (* a (- cu e))
                 yp  (* b su)
-                vf  (/ (* a n) (- 1.0 (* e cu)))   ; common velocity factor
+                vf  (/ (* a n) (- 1.0 (* e cu)))
                 vxp (* (- su) vf)
                 vyp (* (/ b a) cu vf)
                 qx  (- (* xp cos-om) (* yp sin-om))
                 qy  (+ (* xp sin-om) (* yp cos-om))
                 vx  (- (* vxp cos-om) (* vyp sin-om))
                 vy  (+ (* vxp sin-om) (* vyp cos-om))]
-            {:qx qx :qy qy :px (* m vx) :py (* m vy)})
-          ;; ── Hyperbolic orbit ─────────────────────────────────────────────
-          ;; Parameterisation: x'=a(e−cosh F), y'=bh·sinh F, r=a(e·cosh F−1)
-          ;; Time equation: Mh = e·sinh F − F,  Mh = n·t,  n = √(α/ma³)
+            {:qx qx :qy qy :px (* m vx) :py (* m vy)
+             :ecc e :cos-om cos-om :sin-om sin-om
+             :semi-a a :semi-b b :bh Double/NaN :n-mean n
+             :kepler-u u :kepler-F Double/NaN
+             :kepler-xp xp :kepler-yp yp
+             :kepler-vxp vxp :kepler-vyp vyp})
           (let [a   (/ alpha (* 2.0 E))
                 bh  (* a (Math/sqrt (max 0.0 (- (* e e) 1.0))))
                 n   (Math/sqrt (/ alpha (* m a a a)))
                 sh0 (/ y0p bh)
-                F0  (Math/log (+ sh0 (Math/sqrt (+ 1.0 (* sh0 sh0)))))  ; asinh(sh0)
+                F0  (Math/log (+ sh0 (Math/sqrt (+ 1.0 (* sh0 sh0)))))
                 M0h (- (* e (Math/sinh F0)) F0)
                 F   (solve-kepler-hyperbolic e (+ M0h (* n t)))
                 chF (Math/cosh F) shF (Math/sinh F)
@@ -268,7 +279,22 @@
                 qy  (+ (* xp sin-om) (* yp cos-om))
                 vx  (- (* vxp cos-om) (* vyp sin-om))
                 vy  (+ (* vxp sin-om) (* vyp cos-om))]
-            {:qx qx :qy qy :px (* m vx) :py (* m vy)}))))))
+            {:qx qx :qy qy :px (* m vx) :py (* m vy)
+             :ecc e :cos-om cos-om :sin-om sin-om
+             :semi-a a :semi-b Double/NaN :bh bh :n-mean n
+             :kepler-u Double/NaN :kepler-F F
+             :kepler-xp xp :kepler-yp yp
+             :kepler-vxp vxp :kepler-vyp vyp}))))))
+
+(defn- kepler-state-at-t
+  "Exact Keplerian (qx, qy, px, py) at time t via orbital elements.
+   Handles elliptic (E < 0) and hyperbolic (E > 0).
+   Returns nil for degenerate orbits (radial: |L| < 1e-8; near-parabolic: |e−1| < 1e-5)
+   so callers can fall back to numerical integration."
+  [m alpha q0x q0y p0x p0y t]
+  (when-let [{:keys [qx qy px py]} (kepler-orbit-at-t m alpha q0x q0y p0x p0y t)]
+    (when (and (Double/isFinite (double qx)) (Double/isFinite (double qy)))
+      {:qx qx :qy qy :px px :py py})))
 
 (defn generate-data [m alpha q0x q0y p0x p0y dt steps]
   (let [ic           {:qx (double q0x) :qy (double q0y) :px (double p0x) :py (double p0y)}
@@ -407,7 +433,7 @@
 
   :mode — :random (default) or :fixed (uses [[default-scenarios]]); used when
   :evaluation is :data-driven.
-  :evaluation — :data-driven (trajectory fit) or :de-driven (analytical: short-horizon
+  :evaluation — :data-driven (trajectory fit) or :de-driven (analytical: 20% + full-orbit
   trajectory fit on integrated orbits; conserved: invariance along integrated orbits only —
   conserved formulas are not DE solutions). Differential is redundant in :de-driven.
   :sample-count — random scenarios per evaluation batch (default 32).
@@ -468,6 +494,10 @@
 (defn- real-sin [a] (Math/sin (safe-double a)))
 
 (defn- real-cos [a] (Math/cos (safe-double a)))
+
+(defn- real-sinh [a] (Math/sinh (safe-double a)))
+
+(defn- real-cosh [a] (Math/cosh (safe-double a)))
 
 (defn- real-square [a]
   (let [x (safe-double a)] (* x x)))
@@ -550,7 +580,21 @@
                                      ~'omega  (Math/sqrt (max 0.0 (/ ~'alpha (* ~'m ~'r03))))
                                      ~'omega-L (/ (- (* ~'q0x ~'p0y) (* ~'q0y ~'p0x))
                                                   (* ~'m ~'r02))
-                                     ~'energy (grav2d-energy ~'m ~'alpha {:qx ~'q0x :qy ~'q0y :px ~'p0x :py ~'p0y})]
+                                     ~'energy (grav2d-energy ~'m ~'alpha {:qx ~'q0x :qy ~'q0y :px ~'p0x :py ~'p0y})
+                                     ~'kepler (kepler-orbit-at-t ~'m ~'alpha ~'q0x ~'q0y ~'p0x ~'p0y ~'t)
+                                     ~'ecc       (:ecc ~'kepler)
+                                     ~'cos-om    (:cos-om ~'kepler)
+                                     ~'sin-om    (:sin-om ~'kepler)
+                                     ~'semi-a    (:semi-a ~'kepler)
+                                     ~'semi-b    (:semi-b ~'kepler)
+                                     ~'bh        (:bh ~'kepler)
+                                     ~'n-mean    (:n-mean ~'kepler)
+                                     ~'kepler-u  (:kepler-u ~'kepler)
+                                     ~'kepler-F  (:kepler-F ~'kepler)
+                                     ~'kepler-xp (:kepler-xp ~'kepler)
+                                     ~'kepler-yp (:kepler-yp ~'kepler)
+                                     ~'kepler-vxp (:kepler-vxp ~'kepler)
+                                     ~'kepler-vyp (:kepler-vyp ~'kepler)]
                                  (safe-double
                                   ~(prepare-expr-for-compile expr)))))))))
 
@@ -634,20 +678,30 @@
 (defn- all-horizon-times [data]
   (vec (distinct (map :t (filter #(pos? (double (:t %))) data)))))
 
-(defn- short-horizon-times
-  "Times covering only the first `frac` of the trajectory (default 8%).
-   Analytical expressions can't predict full Keplerian orbits (transcendental),
-   but Taylor expansion approximations work well for short horizons.
-   At 8%, the circle arc is ~27° where even 2nd-order Taylor gives <2% error."
-  ([data] (short-horizon-times data 0.08))
+(def analytical-gp-horizon-frac
+  "Minimum training horizon: first 20% of each reference orbit."
+  0.20)
+
+(def analytical-full-horizon-frac
+  "Full-orbit training horizon (all integrated samples)."
+  1.0)
+
+(def analytical-training-horizon-fracs
+  "GP / DE-driven analytical fitness uses min fitness across these horizons."
+  [analytical-gp-horizon-frac analytical-full-horizon-frac])
+
+(defn- horizon-fraction-times
+  "Time samples covering the first `frac` of a trajectory; frac >= 1 uses all samples."
+  ([data] (horizon-fraction-times data analytical-gp-horizon-frac))
   ([data frac]
-   (let [ts (all-horizon-times data)
-         n  (max 1 (int (Math/ceil (* frac (count ts)))))]
-     (vec (take n ts)))))
+   (let [ts (all-horizon-times data)]
+     (if (>= (double frac) 1.0)
+       ts
+       (vec (take (max 1 (int (Math/ceil (* (double frac) (count ts))))) ts))))))
 
 (def repair-horizon-frac
-  "Horizon fraction for MCTS adversarial repair fitness (longer than the 8% GP default)."
-  0.20)
+  "MCTS adversarial repair uses the same dual training horizons as GP (via one-arg fitness)."
+  analytical-gp-horizon-frac)
 
 (defn- initial-ics [data]
   (let [{:keys [qx qy px py]} (first data)]
@@ -773,8 +827,13 @@
     (coll? expr) (boolean (some #(expr-uses-symbol? % sym) expr))
     :else false))
 
+(def ^:private kepler-time-proxy-syms
+  "Kepler derived vars computed from t in compile-state-fn — satisfy trajectory-in-t checks."
+  '#{kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp})
+
 (defn expr-uses-t? [expr]
-  (expr-uses-symbol? expr 't))
+  (or (expr-uses-symbol? expr 't)
+      (some #(expr-uses-symbol? expr %) kepler-time-proxy-syms)))
 
 (def analytical-expr-keys    [:qx-expr :qy-expr :px-expr :py-expr])
 (def differential-expr-keys  [:dqx-expr :dqy-expr :dpx-expr :dpy-expr])
@@ -851,15 +910,24 @@
 (def required-analytical-symbols   '[q0x q0y m])
 (def ^:private required-differential-symbols (into state-vars param-vars))
 
+(def ^:private ic-proxy-syms
+  "Orbit elements derived from ICs in compile-state-fn — cover q0x/q0y mandate for Kepler laws."
+  '#{ecc cos-om sin-om semi-a semi-b bh n-mean
+    kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp
+    r0 r02 r03 omega omega-L})
+
+(defn- sym-covered-in-expr? [expr sym]
+  (or (expr-uses-symbol? expr sym)
+      (and (#{'q0x 'q0y} sym)
+           (some #(expr-uses-symbol? expr %) ic-proxy-syms))
+      (and (#{'qx 'qy} sym)
+           (some #(expr-uses-symbol? expr %) derived-vars))))
+
 (defn- symbols-covered-across-exprs? [expr-keys ind required-syms]
   (every? (fn [sym]
-            ;; r, r2, r3 implicitly cover both qx and qy (r = sqrt(qx²+qy²))
-            (let [position-aliases (when (#{`qx 'qx `qy 'qy} sym) derived-vars)]
-              (some (fn [k]
-                      (let [expr (get ind k)]
-                        (or (expr-uses-symbol? expr sym)
-                            (some #(expr-uses-symbol? expr %) position-aliases))))
-                    expr-keys)))
+            (some (fn [k]
+                    (sym-covered-in-expr? (get ind k) sym))
+                  expr-keys))
           required-syms))
 
 (defn- inject-symbol-into-expr [expr sym]
@@ -993,21 +1061,37 @@
   false)
 
 (def ^:dynamic *template-unbound-arms?*
-  "When true with both-regimes: lock unbound arms to Taylor; evolve bound arms via q/p pair mutations."
+  "When true with both-regimes: lock unbound arms to template; evolve bound arms via q/p pair mutations."
   false)
+
+(def ^:dynamic *template-conic-unbound?*
+  "When true with template-unbound + analytical-blocks: unbound template is :hyperbola-conic (not Taylor)."
+  true)
 
 (def ^:dynamic *analytical-blocks?*
   "When true, inject Emmy-validated analytical catalog blocks (circle, ellipse, Taylor, …)."
   false)
+
+(defn template-unbound-arms-active? []
+  (and *template-unbound-arms?* *both-regimes?*))
+
+(defn- analytical-blocks-active? []
+  (and *analytical-blocks?* *both-regimes?*))
+
+(defn template-conic-unbound-active? []
+  (and *template-conic-unbound?* (template-unbound-arms-active?) (analytical-blocks-active?)))
 
 (def ^:private bound-arm-pairs
   "Hamiltonian-coupled slot pairs for coordinated bound-arm mutation."
   [[:qx-expr :px-expr] [:qy-expr :py-expr]])
 
 (defn unbound-arm-expr
-  "Taylor unbound arm for one analytical slot."
+  "Template unbound arm for one analytical slot (Taylor or :hyperbola-conic)."
   [expr-key]
-  (get unbound-linear-analytical-exprs expr-key))
+  (if-let [conic (when (template-conic-unbound-active?)
+                   (blocks/hyperbola-conic-slots))]
+    (get conic expr-key (get unbound-linear-analytical-exprs expr-key))
+    (get unbound-linear-analytical-exprs expr-key)))
 
 (defn slot-with-bound-arm
   "Wrap bound-arm in (e/if (neg? energy) bound Taylor-unbound)."
@@ -1025,33 +1109,91 @@
                cartesian-analytical-expr-keys))
     leg))
 
-(defn template-unbound-arms-active? []
-  (and *template-unbound-arms?* *both-regimes?*))
+(defn bound-arm-expr
+  "First-order Taylor bound arm — pairs with unbound catalog blocks."
+  [expr-key]
+  (get blocks/taylor-bound-slots expr-key))
 
-(defn- analytical-blocks-active? []
-  (and *analytical-blocks?* *both-regimes?*))
+(defn slot-with-unbound-arm
+  "Wrap unbound-arm in (e/if (neg? energy) Taylor-bound unbound)."
+  [expr-key unbound-expr]
+  (list 'e/if '(neg? energy) (bound-arm-expr expr-key) unbound-expr))
+
+(defn- wrap-kepler-conic-strict
+  "Both-regimes strict shell: :ellipse-conic bound + :hyperbola-conic unbound."
+  [entry]
+  (into {:strategy :analytical :domain :any}
+        (map (fn [k]
+               [k (list 'e/if '(neg? energy)
+                        (get (:bound-slots entry) k)
+                        (get (:unbound-slots entry) k))])
+             cartesian-analytical-expr-keys)))
+
+(defn- wrap-catalog-entry-strict
+  "Strict e/if shell for one catalog entry (bound → template unbound; unbound → Taylor bound)."
+  [entry]
+  (cond
+    (= :kepler-conic (:id entry))
+    (wrap-kepler-conic-strict entry)
+
+    :else
+    (let [regime (:regime entry :bound)
+          slots  (:slots entry)
+          leg    (into {:strategy :analytical
+                        :domain (if *both-regimes?* :any (blocks/regime->domain regime))}
+                       slots)]
+      (cond
+        (not *both-regimes?*)
+        leg
+
+        (= regime :unbound)
+        (into leg
+              (map (fn [k] [k (slot-with-unbound-arm k (get slots k))])
+                   cartesian-analytical-expr-keys))
+
+        (template-unbound-arms-active?)
+        (template-unbound-arms-law
+         (into leg
+               (map (fn [k] [k (slot-with-bound-arm k (get slots k))])
+                    cartesian-analytical-expr-keys)))
+
+        :else
+        (wrap-analytical-energy-branches leg)))))
 
 (defn- catalog-law-as-individual []
-  (let [leg (blocks/random-catalog-law)]
-    (if (and *both-regimes?* (template-unbound-arms-active?))
-      (template-unbound-arms-law
-       (into leg
-             (map (fn [k] [k (slot-with-bound-arm k (get leg k))])
-                  cartesian-analytical-expr-keys)))
-      (if *both-regimes?*
-        (wrap-analytical-energy-branches leg)
-        leg))))
+  (if (and (template-conic-unbound-active?) (blocks/kepler-conic-valid?) (< (rand) 0.40))
+    (wrap-kepler-conic-strict (blocks/kepler-conic-entry))
+    (wrap-catalog-entry-strict (blocks/random-catalog-entry))))
+
+(defn- strict-catalog-law-from-entry [entry]
+  (wrap-catalog-entry-strict entry))
+
+(defn- apply-catalog-unbound-pair-to-law
+  "Re-wrap one (q,p) pair: preserve bound arm, lock unbound to hyperbola-conic template."
+  [leg]
+  (let [pair (rand-nth (blocks/unbound-pairs))]
+    (into leg
+          (map (fn [slot]
+                 [slot (slot-with-bound-arm slot (regime-arm-expr (get leg slot) :bound))])
+               pair))))
 
 (defn- apply-catalog-pair-to-law [leg]
-  (let [entry (blocks/random-catalog-entry)
-        pair  (rand-nth (blocks/bound-pairs))
-        grafted (blocks/graft-bound-pair leg entry pair)]
-    (if (template-unbound-arms-active?)
+  (let [entry   (blocks/random-catalog-entry)
+        pair    (rand-nth (if (= :unbound (:regime entry))
+                          (blocks/unbound-pairs)
+                          (blocks/bound-pairs)))
+        grafted (blocks/graft-catalog-pair leg :entry entry :pair pair)]
+    (if (= :unbound (:regime entry))
       (into grafted
             (map (fn [slot]
-                   [slot (slot-with-bound-arm slot (get grafted slot))])
+                   [slot (slot-with-unbound-arm slot (get grafted slot))])
                  pair))
-      grafted)))
+      (if (template-unbound-arms-active?)
+        (into grafted
+              (map (fn [slot]
+                     [slot (slot-with-bound-arm slot (get grafted slot))])
+                   pair))
+        grafted))))
 
 (defn- per-regime-arm-fitness? [ind]
   (and *both-regimes?* (analytical-strict-energy-branches? ind)))
@@ -1511,6 +1653,10 @@
                   (if latex? (str "\\sin\\left(" a "\\right)") (str "sin(" a ")")))
           e/cos (let [a (child (first args))]
                   (if latex? (str "\\cos\\left(" a "\\right)") (str "cos(" a ")")))
+          e/sinh (let [a (child (first args))]
+                   (if latex? (str "\\sinh\\left(" a "\\right)") (str "sinh(" a ")")))
+          e/cosh (let [a (child (first args))]
+                   (if latex? (str "\\cosh\\left(" a "\\right)") (str "cosh(" a ")")))
           e/div (let [a (child (first args)) b (child (second args))]
                   (if latex? (str "\\frac{" a "}{" b "}") (str "(" a " / " b ")")))
           e/if (let [[test then else] args
@@ -1626,13 +1772,18 @@
        :metrics metrics
        :sample sample})))
 
-(def ops '[+ - * e/square e/sin e/cos e/div e/sqrt e/if])
+(def ops '[+ - * e/square e/sin e/cos e/sinh e/cosh e/div e/sqrt e/if])
 ;; Derived variables pre-computed by compile-state-fn from initial conditions.
 ;; r0/r02/r03/r05/r06 — initial radius powers (r₀¹,²,³,⁵,⁶)
 ;; omega             — circular angular velocity sqrt(α/m/r₀³); exact for circular orbit
 ;; omega-L           — actual initial angular velocity (q×p)/(m·r₀²); valid for any orbit
 ;; energy            — H(q₀,p₀); use with (e/if (neg? energy) bound-branch unbound-branch)
-(def analytical-derived-vars '[r0 r02 r03 r05 r06 omega omega-L energy])
+;; ecc, cos-om, sin-om, semi-a, semi-b, bh, n-mean — Kepler elements at t
+;; kepler-u, kepler-F — eccentric/hyperbolic anomaly; kepler-xp/yp, kepler-vxp/vyp — periapsis frame
+(def analytical-derived-vars
+  '[r0 r02 r03 r05 r06 omega omega-L energy
+    ecc cos-om sin-om semi-a semi-b bh n-mean
+    kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp])
 (def analytical-vars (vec (concat '[t] ic-vars param-vars analytical-derived-vars)))
 (def differential-vars (vec (concat state-vars param-vars derived-vars)))
 
@@ -1651,7 +1802,7 @@
 (defn- random-atom [vars]
   (rand-nth (concat vars constants)))
 
-(def unary-ops '#{e/square e/sin e/cos e/sqrt})
+(def unary-ops '#{e/square e/sin e/cos e/sinh e/cosh e/sqrt})
 (def ternary-ops '#{e/if})
 
 (defn random-expression
@@ -2198,6 +2349,19 @@
            (< r 0.67) :differential
            :else :conserved)))])))
 
+(defn- escape-deep-reseed-population
+  "Full population for [escape+]: cycle validated catalog laws (strict template), else random."
+  [n]
+  (if (and (= *strategy-filter* :analytical) (analytical-blocks-active?))
+    (let [entries (cond-> (vec blocks/validated-catalog)
+                    (blocks/kepler-conic-valid?) (conj (blocks/kepler-conic-entry)))
+          inds (mapv #(laws-individual [(law-from-legacy (strict-catalog-law-from-entry %))])
+                     entries)]
+      (if (seq inds)
+        (vec (take n (cycle inds)))
+        (vec (repeatedly n random-individual))))
+    (vec (repeatedly n random-individual))))
+
 ;; ── Physics seeds ─────────────────────────────────────────────────────────────
 ;; Hand-crafted individuals encoding known correct or near-correct physics.
 ;; Injected into the initial population when --seed is passed so the GP can
@@ -2404,7 +2568,12 @@
 (declare calculate-analytical-slice-fitness-at-horizon)
 
 (defn calculate-analytical-fitness-at-horizon
-  ([ind dataset] (calculate-analytical-fitness-at-horizon ind dataset 0.08))
+  "Single-scenario analytical fitness at one horizon fraction, or dual training horizons
+   (20% + full orbit) when `horizon-frac` is omitted."
+  ([ind dataset]
+   (apply min
+          (mapv #(calculate-analytical-fitness-at-horizon ind dataset %)
+                analytical-training-horizon-fracs)))
   ([ind dataset horizon-frac]
    (try
      (cond
@@ -2423,16 +2592,13 @@
                  D    (char-scale data)
                  fns  (compile-analytical-fns ind chart)
                  ds   (assoc dataset :chart chart)
-                 errors (horizon-errors-analytical fns ds (short-horizon-times data horizon-frac))]
+                 errors (horizon-errors-analytical fns ds (horizon-fraction-times data horizon-frac))]
              (fitness-from-errors errors D))
            0.0)))
      (catch Exception _ 0.0))))
 
 (defn calculate-analytical-fitness [ind dataset]
-  ;; Analytical expressions cannot predict full Keplerian trajectories (transcendental).
-  ;; We evaluate only the short-horizon portion where Taylor expansion approximations
-  ;; (q ≈ q₀ + v₀t + ½·F·t², p ≈ p₀ + F·t) are achievable by GP.
-  (calculate-analytical-fitness-at-horizon ind dataset 0.08))
+  (calculate-analytical-fitness-at-horizon ind dataset))
 
 (defn adversarial-repair-target
   "For an analytical individual, return the weakest scenario and expression slot to patch.
@@ -2447,8 +2613,7 @@
                        (mapv (fn [ds]
                                {:dataset ds
                                 :scenario-fitness
-                                (calculate-analytical-fitness-at-horizon
-                                 leg ds repair-horizon-frac)})
+                                (calculate-analytical-fitness-at-horizon leg ds)})
                              applicable))
                 metrics (evaluate-predictions leg dataset)
                 finite? (fn [x] (and (number? x) (Double/isFinite x) (pos? x)))
@@ -2543,27 +2708,33 @@
                 D    (char-scale data)
                 fns  (compile-analytical-fns ind chart)
                 ds   (assoc dataset :chart chart)
-                errors (horizon-errors-analytical fns ds (short-horizon-times data horizon-frac))]
+                errors (horizon-errors-analytical fns ds (horizon-fraction-times data horizon-frac))]
             (fitness-from-errors errors D)))))
     (catch Exception _ 0.0)))
 
-(defn- calculate-analytical-per-regime-fitness-at-horizon
-  "Both-regimes: bound arms on bound scenarios, unbound arms on unbound; fitness = min(regimes)."
-  [ind datasets horizon-frac & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
+(defn- calculate-analytical-slice-fitness
+  "Regime-sliced fitness: min over 20% and full-orbit horizons on one scenario."
+  [ind dataset]
+  (apply min
+         (mapv #(calculate-analytical-slice-fitness-at-horizon ind dataset %)
+               analytical-training-horizon-fracs)))
+
+(defn- calculate-analytical-per-regime-fitness
+  "Both-regimes: bound arms on bound scenarios, unbound arms on unbound; fitness = min(regimes).
+   Each scenario scored at min(20% horizon, full orbit)."
+  [ind datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
   (let [bound-ds   (filterv #(= :bound (dataset-regime-for-fitness %)) datasets)
         unbound-ds (filterv #(= :unbound (dataset-regime-for-fitness %)) datasets)
         bound-ind  (analytical-law-regime-slice ind :bound)
         unbound-ind (analytical-law-regime-slice ind :unbound)
         bound-fit  (when (seq bound-ds)
                      (aggregate-scenario-fitness
-                      (mapv #(calculate-analytical-slice-fitness-at-horizon
-                              bound-ind % horizon-frac)
+                      (mapv #(calculate-analytical-slice-fitness bound-ind %)
                             bound-ds)
                       :aggregate aggregate :percentile percentile))
         unbound-fit (when (seq unbound-ds)
                       (aggregate-scenario-fitness
-                       (mapv #(calculate-analytical-slice-fitness-at-horizon
-                               unbound-ind % horizon-frac)
+                       (mapv #(calculate-analytical-slice-fitness unbound-ind %)
                              unbound-ds)
                        :aggregate aggregate :percentile percentile))
         regime-fits (vec (remove nil? [bound-fit unbound-fit]))]
@@ -2572,8 +2743,7 @@
       0.0)))
 
 (defn- calculate-analytical-de-driven-fitness
-  "DE-driven analytical: short-horizon trajectory fit on integrated reference orbits
-   (same as data-driven analytical — not ODE residual on random phase probes).
+  "DE-driven analytical: 20% + full-orbit trajectory fit on integrated reference orbits.
    With both-regimes strict branches: bound arms on bound scenarios, unbound on unbound."
   [ind datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
   (try
@@ -2582,8 +2752,8 @@
         (if (empty? datasets)
           0.0
           (if (per-regime-arm-fitness? ind)
-            (calculate-analytical-per-regime-fitness-at-horizon
-             ind datasets 0.08 :aggregate aggregate :percentile percentile)
+            (calculate-analytical-per-regime-fitness
+             ind datasets :aggregate aggregate :percentile percentile)
             (aggregate-scenario-fitness
              (mapv (fn [ds] (calculate-analytical-fitness ind ds)) datasets)
              :aggregate aggregate :percentile percentile)))))
@@ -2591,7 +2761,7 @@
 
 (defn- calculate-de-driven-fitness
   "Fitness from the environment physics — not naked trajectory matching in data-driven mode.
-   Analytical: short-horizon fit on integrated orbits. Conserved: invariance along orbits only.
+   Analytical: 20% + full-orbit fit on integrated orbits. Conserved: invariance along orbits only.
    Differential rate laws score 0 (redundant with the known equations of motion)."
   [ind _phase-states datasets & {:keys [aggregate percentile] :or {aggregate :min percentile 0.1}}]
   (case (:strategy ind)
@@ -2624,8 +2794,9 @@
 (defn calculate-fitness-scenarios
   "Robust fitness over scenario datasets: :min (worst case) or :percentile (e.g. p10).
 
-  When :evaluation is :de-driven, scores analytical laws by short-horizon trajectory fit on
-  integrated reference orbits; conserved laws by invariance along those orbits only (not as
+  When :evaluation is :de-driven, scores analytical laws by min(20% horizon, full-orbit)
+  trajectory fit on integrated reference orbits; conserved laws by invariance along those
+  orbits only (not as
   DE solutions). Differential always scores 0.
 
   Composite individuals (:laws with multiple entries) take the worst law fitness.
@@ -2955,7 +3126,7 @@
        (not (expr-uses-symbol? expr 'py))))
 
 (defn- block-junk-score [expr]
-  (+ (* 2.0 (count (filter #(and (sequential? %) (#{'e/sin 'e/cos} (first %)))
+  (+ (* 2.0 (count (filter #(and (sequential? %) (#{'e/sin 'e/cos 'e/sinh 'e/cosh} (first %)))
                           (tree-seq sequential? seq expr))))
      (* 1.0 (count (filter #(and (sequential? %) (= 'e/sqrt (first %)))
                           (tree-seq sequential? seq expr))))
@@ -2975,7 +3146,8 @@
      :kinetic? (kinetic-like? expr)
      :potential? (potential-like? expr)
      :angular? (angular-like? expr)
-     :trig? (or (expr-uses-op? expr 'e/sin) (expr-uses-op? expr 'e/cos))
+     :trig? (or (expr-uses-op? expr 'e/sin) (expr-uses-op? expr 'e/cos)
+                (expr-uses-op? expr 'e/sinh) (expr-uses-op? expr 'e/cosh))
      :junk-score (block-junk-score expr)}))
 
 (defn abstract-slot-blocks
@@ -3167,8 +3339,14 @@
 
 (defn- pair-mutate-analytical-individual [ind]
   (let [pair (rand-nth bound-arm-pairs)]
-    (-> (if (and (analytical-blocks-active?) (< (rand) 0.3))
+    (-> (cond
+          (and (analytical-blocks-active?) (< (rand) 0.3))
           (apply-catalog-pair-to-law ind)
+
+          (and (template-conic-unbound-active?) (< (rand) 0.25))
+          (apply-catalog-unbound-pair-to-law ind)
+
+          :else
           (reduce mutate-bound-slot ind pair))
         template-unbound-arms-law
         validate-and-repair-law)))
@@ -3550,6 +3728,7 @@
                :mcts-mutate-rate default-mcts-mutate-rate
                :mcts-mutate-simulations default-mcts-mutate-simulations
                :template-unbound-arms? true
+               :template-conic-unbound? true
                :analytical-blocks? true
                :mcts? true
                :prompt-each-generation false
@@ -3585,6 +3764,8 @@
           "--mcts-mutate" (recur (assoc opts :mcts-mutate? true) more)
           "--no-template-unbound" (recur (assoc opts :template-unbound-arms? false) more)
           "--template-unbound" (recur (assoc opts :template-unbound-arms? true) more)
+          "--no-template-conic-unbound" (recur (assoc opts :template-conic-unbound? false) more)
+          "--template-conic-unbound" (recur (assoc opts :template-conic-unbound? true) more)
           "--no-analytical-blocks" (recur (assoc opts :analytical-blocks? false) more)
           "--analytical-blocks" (recur (assoc opts :analytical-blocks? true) more)
           "--mcts-until-stop" (recur (assoc opts :mcts-until-stop true) more)
@@ -3733,6 +3914,7 @@
                 mcts-repair? mcts-repair-simulations mcts-repair-inject
                 mcts-mutate? mcts-mutate-rate mcts-mutate-simulations
                 template-unbound-arms?
+                template-conic-unbound?
                 analytical-blocks?]}
         (parse-args args)
         de-driven? (= :de-driven (:evaluation fitness-context))
@@ -3744,6 +3926,8 @@
                                   de-driven? (= strategy :analytical))
         analytical-blocks-on? (and analytical-blocks? both-regimes-on?
                                    de-driven? (= strategy :analytical))
+        template-conic-on? (and template-conic-unbound? template-unbound-on?
+                                analytical-blocks-on? (blocks/kepler-conic-valid?))
         report-scenarios default-scenarios
         ref-datasets (scenarios->datasets report-scenarios)
         preferred-chart (coords/dominant-chart ref-datasets)]
@@ -3752,6 +3936,7 @@
             *de-driven-search?* de-driven?
             *both-regimes?* both-regimes-on?
             *template-unbound-arms?* template-unbound-on?
+            *template-conic-unbound?* template-conic-on?
             *analytical-blocks?* analytical-blocks-on?
             *mcts-mutate?* mcts-mutate-on?
             *mcts-mutate-rate* mcts-mutate-rate
@@ -3762,11 +3947,15 @@
   (when de-driven?
     (println
      (if (= strategy :analytical)
-       (str "Each individual: analytical laws only (short-horizon orbit fit)"
+       (str "Each individual: analytical laws only (20% + full-orbit fit)"
             (when both-regimes-on?
               (str "; both regimes (per-regime arm fitness, strict e/if on energy)"
                    (when template-unbound-on?
-                     ", Taylor unbound template + q/p pair mutations"))))
+                     (str ", "
+                          (if template-conic-on?
+                            "hyperbola-conic unbound template"
+                            "Taylor unbound template")
+                          " + q/p pair mutations"))))
        (if (= strategy :conserved)
          "Each individual: analytical laws + conserved laws (composite; min fitness)"
          "Each individual: analytical laws (motion DE) + conserved laws (invariants along orbits, not DE solutions)"))))
@@ -3777,11 +3966,14 @@
     (println (str "MCTS mutation: " (int (* 100 mcts-mutate-rate))
                   "% of analytical mutates, " mcts-mutate-simulations " sims each")))
   (when template-unbound-on?
-    (println "Template unbound arms: Taylor locked; bound arms mutate in (qx,px)/(qy,py) pairs"))
+    (println (if template-conic-on?
+               "Template unbound arms: hyperbola-conic (sinh/cosh F) locked; bound arms mutate in (qx,px)/(qy,py) pairs"
+               "Template unbound arms: Taylor locked; bound arms mutate in (qx,px)/(qy,py) pairs")))
   (when analytical-blocks-on?
     (println (str "Analytical blocks (Emmy-validated): "
                   (blocks/catalog-block-count)
-                  " catalog laws — circle, ellipse, Taylor, harmonic")))
+                  " catalog laws + kepler-conic inject"
+                  " — circle, ellipse, harmonic, conic (sinh/cosh)")))
   (let [{:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
                                      :seed?  seed?
@@ -3847,30 +4039,40 @@
                                               escape-deep? 20
                                               escape-burst? 10
                                               :else 5)
-                           pop-with-hof     (if (and @hall-of-fame (not escape?))
-                                              (assoc (vec pop) (dec (count pop))
-                                                     (:ind @hall-of-fame))
-                                              pop)
                            hof-gk           (when (and escape-burst? @hall-of-fame)
                                               (individual-genome-key (:ind @hall-of-fame)))
+                           _ (when escape-deep?
+                               (println (if (and (= strategy :analytical) (analytical-blocks-active?))
+                                          (format "  [escape+] catalog reseed (%d slots, HoF held back)"
+                                                  population-size)
+                                          (format "  [escape+] full reseed (%d slots, HoF held back)"
+                                                  population-size))))
                            pop-diverse      (binding [*fast-immigrants?* (or escape-burst? escape-deep?)]
                                               (cond
                                                 escape-deep?
-                                                (vec (repeatedly population-size random-individual))
+                                                (escape-deep-reseed-population population-size)
 
                                                 escape-burst?
                                                 (let [without-basin (if hof-gk
                                                                       (vec (remove #(= hof-gk
                                                                                        (individual-genome-key %))
-                                                                                   pop-with-hof))
-                                                                      pop-with-hof)
+                                                                                   pop))
+                                                                      pop)
                                                       n-keep (max 0 (quot population-size 5))
                                                       kept   (vec (take n-keep without-basin))
-                                                      n-fresh (min (- population-size (count kept))
-                                                                   (quot population-size 3))]
+                                                      n-fresh (- population-size (count kept))]
                                                   (into kept (repeatedly n-fresh random-individual)))
 
-                                                :else pop-with-hof))
+                                                :else pop))
+                           ;; HoF injected after escape shake-ups — except [escape+] catalog reseed (explore past HoF basin).
+                           pop-for-breed    (let [base (let [v (vec pop-diverse)]
+                                                         (if (< (count v) population-size)
+                                                           (into v (repeatedly (- population-size (count v))
+                                                                               random-individual))
+                                                           (vec (take population-size v))))]
+                                              (if (and @hall-of-fame (not escape-deep?))
+                                                (assoc base (dec population-size) (:ind @hall-of-fame))
+                                                base))
                            repair-n (when mcts-repair-on?
                                       (cond
                                         escape-deep? 0
@@ -3892,7 +4094,7 @@
                                           *fast-immigrants?* (or escape-burst? escape-deep?)
                                           *fitness-timeout-ms* (when (or escape-burst? escape-deep?)
                                                                  90000)]
-                                  (evolve-generation pop-diverse fitness-context population-size gen-idx
+                                  (evolve-generation pop-for-breed fitness-context population-size gen-idx
                                                      :extra-immigrants extra-imm
                                                      :elite-divisor elite-divisor
                                                      :behavior-probes behavior-probes-lite
@@ -3977,7 +4179,7 @@
     (println "total generations (cumulative):" total-generations)
     (println (str "fitness mode: " (name fitness-mode)
                   (when de-driven?
-                    " | evaluation: DE-driven (analytical short-horizon orbits + conserved invariance)")
+                    " | evaluation: DE-driven (analytical 20%+full-orbit + conserved invariance)")
                   (when-not de-driven?
                     (str " | scenarios/gen: " (if (= fitness-mode :fixed)
                                                 (count default-scenarios)
@@ -4043,4 +4245,4 @@
                               " regime=both"
                               :else
                               (str " domain=" (name (analytical-law-domain (law->legacy law))))))
-                          " mse=" (format-mse (:mse metrics))))))))))))
+                          " mse=" (format-mse (:mse metrics)))))))))))))

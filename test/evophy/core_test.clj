@@ -334,6 +334,19 @@
                 :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}]
     (is (pos? (calculate-fitness-scenarios cart ds :evaluation :de-driven)))))
 
+(deftest analytical-dual-horizon-fitness-is-min-of-20-and-full
+  (let [circle (scenario-data (first default-scenarios))
+        taylor {:strategy :analytical :domain :bound
+                :qx-expr '(+ q0x (* (e/div p0x m) t))
+                :qy-expr '(+ q0y (* (e/div p0y m) t))
+                :px-expr '(+ p0x (* (e/div (* (* -1.0 alpha) q0x) r03) t))
+                :py-expr '(+ p0y (* (e/div (* (* -1.0 alpha) q0y) r03) t))}
+        short-fit (calculate-analytical-fitness-at-horizon taylor circle 0.20)
+        full-fit  (calculate-analytical-fitness-at-horizon taylor circle 1.0)
+        dual-fit  (calculate-analytical-fitness taylor circle)]
+    (is (= dual-fit (min short-fit full-fit)))
+    (is (< full-fit short-fit))))
+
 (deftest evaluate-predictions-survives-nonreal-intermediates
   (let [ds (scenario-data (first default-scenarios))
         junk {:strategy :analytical
@@ -491,3 +504,14 @@
           (is (analytical-strict-energy-branches? child))
           (is (= (unbound-arm-expr :qx-expr) (:qx-expr unbound)))
           (is (= (unbound-arm-expr :py-expr) (:py-expr unbound))))))))
+
+(deftest escape-deep-reseed-uses-catalog-without-hof-slot
+  (binding [*both-regimes?* true
+            *template-unbound-arms?* true
+            *analytical-blocks?* true
+            *strategy-filter* :analytical
+            *de-driven-search?* true]
+    (let [pop (#'evophy.core/escape-deep-reseed-population 12)]
+      (is (= 12 (count pop)))
+      (is (every? genome-valid? pop))
+      (is (every? analytical-strict-energy-branches? (map first-law-legacy pop))))))
