@@ -42,7 +42,7 @@
             k-fit (#'core/calculate-analytical-de-driven-fitness kepler ds)
             e-fit (#'core/calculate-analytical-de-driven-fitness ell-only ds)]
         (is (analytical-strict-energy-branches? kepler))
-        (is (expr-uses-op? (unbound-arm-expr :qx-expr) 'e/sinh))
+        (is (#'core/expr-uses-op? (unbound-arm-expr :qx-expr) 'e/sinh))
         (is (> k-fit e-fit))
         (is (> k-fit 0.95))))))
 

@@ -6,6 +6,7 @@
             [emmy.env :as e]
             [evophy.analytical-blocks :as blocks]
             [evophy.coords :as coords]
+            [evophy.primitives :as prims]
             [taoensso.timbre :as timbre]))
 
 (defn- rewrite-div-in-expr [expr]
@@ -185,106 +186,14 @@
      :py (+ py' (* (:dpy d3) half))}))
 
 ;; ── Exact Keplerian solver ────────────────────────────────────────────────
-;; Solves Kepler's equation via Newton's method so generated data has zero
-;; orbital drift regardless of how many periods are integrated.
-
-(defn- solve-kepler-elliptic
-  "Solve M = u − e·sin(u) for eccentric anomaly u (elliptic orbit, 0 ≤ e < 1)."
-  ^double [^double e ^double M]
-  (let [twopi (* 2.0 Math/PI)
-        M     (- M (* twopi (Math/floor (/ M twopi))))]
-    (loop [u (double M) n 0]
-      (let [du (/ (- u (* e (Math/sin u)) M)
-                  (- 1.0 (* e (Math/cos u))))]
-        (if (or (< (Math/abs du) 1e-12) (> n 60))
-          u
-          (recur (- u du) (inc n)))))))
-
-(defn- solve-kepler-hyperbolic
-  "Solve Mh = e·sinh(F) − F for hyperbolic anomaly F (hyperbolic orbit, e > 1)."
-  ^double [^double e ^double Mh]
-  (loop [F (double Mh) n 0]
-    (let [dF (/ (- (* e (Math/sinh F)) F Mh)
-                (- (* e (Math/cosh F)) 1.0))]
-      (if (or (< (Math/abs dF) 1e-12) (> n 60))
-        F
-        (recur (- F dF) (inc n))))))
+;; Unified complex oracle in evophy.primitives (M = u − e·sin u, n = (−2E)^(3/2)/(α√m)).
 
 (defn- kepler-orbit-nan []
-  {:qx Double/NaN :qy Double/NaN :px Double/NaN :py Double/NaN
-   :ecc Double/NaN :cos-om Double/NaN :sin-om Double/NaN
-   :semi-a Double/NaN :semi-b Double/NaN :bh Double/NaN :n-mean Double/NaN
-   :kepler-u Double/NaN :kepler-F Double/NaN
-   :kepler-xp Double/NaN :kepler-yp Double/NaN
-   :kepler-vxp Double/NaN :kepler-vyp Double/NaN})
+  (prims/kepler-orbit-nan))
 
 (defn- kepler-orbit-at-t
-  "Exact Kepler conic state plus orbital elements for analytical catalog laws.
-   Elliptic: x'=a(cos u−e), y'=b sin u.  Hyperbolic: x'=a(e−cosh F), y'=b_h sinh F."
   [m alpha q0x q0y p0x p0y t]
-  (let [q0x   (double q0x) q0y (double q0y)
-        p0x   (double p0x) p0y (double p0y)
-        m     (double m)   alpha (double alpha) t (double t)
-        r0    (Math/sqrt (+ (* q0x q0x) (* q0y q0y)))
-        L     (- (* q0x p0y) (* q0y p0x))
-        E     (grav2d-energy m alpha {:qx q0x :qy q0y :px p0x :py p0y})
-        ex    (- (/ (* p0y L) (* m alpha)) (/ q0x r0))
-        ey    (- (/ (* (- p0x) L) (* m alpha)) (/ q0y r0))
-        e     (Math/sqrt (+ (* ex ex) (* ey ey)))]
-    (if (or (<= (Math/abs L) 1e-8)
-            (<= (Math/abs (- e 1.0)) 1e-5))
-      (kepler-orbit-nan)
-      (let [omega  (Math/atan2 ey ex)
-            cos-om (Math/cos omega)
-            sin-om (Math/sin omega)
-            x0p    (+ (* q0x cos-om) (* q0y sin-om))
-            y0p    (+ (* (- q0x) sin-om) (* q0y cos-om))]
-        (if (neg? E)
-          (let [a   (/ alpha (* -2.0 E))
-                b   (* a (Math/sqrt (max 0.0 (- 1.0 (* e e)))))
-                n   (Math/sqrt (/ alpha (* m a a a)))
-                u0  (Math/atan2 (/ y0p b) (+ (/ x0p a) e))
-                M0  (- u0 (* e (Math/sin u0)))
-                u   (solve-kepler-elliptic e (+ M0 (* n t)))
-                cu  (Math/cos u) su (Math/sin u)
-                xp  (* a (- cu e))
-                yp  (* b su)
-                vf  (/ (* a n) (- 1.0 (* e cu)))
-                vxp (* (- su) vf)
-                vyp (* (/ b a) cu vf)
-                qx  (- (* xp cos-om) (* yp sin-om))
-                qy  (+ (* xp sin-om) (* yp cos-om))
-                vx  (- (* vxp cos-om) (* vyp sin-om))
-                vy  (+ (* vxp sin-om) (* vyp cos-om))]
-            {:qx qx :qy qy :px (* m vx) :py (* m vy)
-             :ecc e :cos-om cos-om :sin-om sin-om
-             :semi-a a :semi-b b :bh Double/NaN :n-mean n
-             :kepler-u u :kepler-F Double/NaN
-             :kepler-xp xp :kepler-yp yp
-             :kepler-vxp vxp :kepler-vyp vyp})
-          (let [a   (/ alpha (* 2.0 E))
-                bh  (* a (Math/sqrt (max 0.0 (- (* e e) 1.0))))
-                n   (Math/sqrt (/ alpha (* m a a a)))
-                sh0 (/ y0p bh)
-                F0  (Math/log (+ sh0 (Math/sqrt (+ 1.0 (* sh0 sh0)))))
-                M0h (- (* e (Math/sinh F0)) F0)
-                F   (solve-kepler-hyperbolic e (+ M0h (* n t)))
-                chF (Math/cosh F) shF (Math/sinh F)
-                xp  (* a (- e chF))
-                yp  (* bh shF)
-                vf  (/ (* a n) (- (* e chF) 1.0))
-                vxp (* (- shF) vf)
-                vyp (* (/ bh a) chF vf)
-                qx  (- (* xp cos-om) (* yp sin-om))
-                qy  (+ (* xp sin-om) (* yp cos-om))
-                vx  (- (* vxp cos-om) (* vyp sin-om))
-                vy  (+ (* vxp sin-om) (* vyp cos-om))]
-            {:qx qx :qy qy :px (* m vx) :py (* m vy)
-             :ecc e :cos-om cos-om :sin-om sin-om
-             :semi-a a :semi-b Double/NaN :bh bh :n-mean n
-             :kepler-u Double/NaN :kepler-F F
-             :kepler-xp xp :kepler-yp yp
-             :kepler-vxp vxp :kepler-vyp vyp}))))))
+  (prims/kepler-orbit-at-t m alpha q0x q0y p0x p0y t))
 
 (defn- kepler-state-at-t
   "Exact Keplerian (qx, qy, px, py) at time t via orbital elements.
@@ -499,6 +408,16 @@
 
 (defn- real-cosh [a] (Math/cosh (safe-double a)))
 
+;; Graded primitive delegates — visible to eval in compile-state-fn.
+(defn mean-anomaly [n t m0] (prims/mean-anomaly n t m0))
+(defn anomaly-from-M [e energy M] (prims/anomaly-from-M e energy M))
+(defn periapsis-xp [semi-a ecc energy anomaly]
+  (prims/periapsis-xp semi-a ecc energy anomaly))
+(defn periapsis-yp [semi-b bh energy anomaly]
+  (prims/periapsis-yp semi-b bh energy anomaly))
+(defn lab-qx [cos-om sin-om xp yp] (prims/lab-qx cos-om sin-om xp yp))
+(defn lab-qy [sin-om cos-om xp yp] (prims/lab-qy sin-om cos-om xp yp))
+
 (defn- real-square [a]
   (let [x (safe-double a)] (* x x)))
 
@@ -540,7 +459,9 @@
     (simplify-expr expr)))
 
 (defn- prepare-expr-for-compile [expr]
-  (-> expr simplify-if-small rewrite-div-in-expr rewrite-real-ops-in-expr))
+  (-> expr simplify-if-small rewrite-div-in-expr
+      prims/rewrite-primitives-in-expr
+      rewrite-real-ops-in-expr))
 
 (def ^:private ^java.util.concurrent.ConcurrentHashMap compile-fn-cache
   (java.util.concurrent.ConcurrentHashMap.))
@@ -582,6 +503,7 @@
                                                   (* ~'m ~'r02))
                                      ~'energy (grav2d-energy ~'m ~'alpha {:qx ~'q0x :qy ~'q0y :px ~'p0x :py ~'p0y})
                                      ~'kepler (kepler-orbit-at-t ~'m ~'alpha ~'q0x ~'q0y ~'p0x ~'p0y ~'t)
+                                     ~'kepler-M0 (prims/M0-at-ic ~'m ~'alpha ~'q0x ~'q0y ~'p0x ~'p0y)
                                      ~'ecc       (:ecc ~'kepler)
                                      ~'cos-om    (:cos-om ~'kepler)
                                      ~'sin-om    (:sin-om ~'kepler)
@@ -589,6 +511,7 @@
                                      ~'semi-b    (:semi-b ~'kepler)
                                      ~'bh        (:bh ~'kepler)
                                      ~'n-mean    (:n-mean ~'kepler)
+                                     ~'kepler-M  (+ ~'kepler-M0 (* ~'n-mean ~'t))
                                      ~'kepler-u  (:kepler-u ~'kepler)
                                      ~'kepler-F  (:kepler-F ~'kepler)
                                      ~'kepler-xp (:kepler-xp ~'kepler)
@@ -829,7 +752,7 @@
 
 (def ^:private kepler-time-proxy-syms
   "Kepler derived vars computed from t in compile-state-fn — satisfy trajectory-in-t checks."
-  '#{kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp})
+  '#{kepler-u kepler-F kepler-M kepler-xp kepler-yp kepler-vxp kepler-vyp})
 
 (defn expr-uses-t? [expr]
   (or (expr-uses-symbol? expr 't)
@@ -912,8 +835,8 @@
 
 (def ^:private ic-proxy-syms
   "Orbit elements derived from ICs in compile-state-fn — cover q0x/q0y mandate for Kepler laws."
-  '#{ecc cos-om sin-om semi-a semi-b bh n-mean
-    kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp
+  '#{ecc cos-om sin-om semi-a semi-b bh n-mean kepler-M0
+    kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp kepler-M
     r0 r02 r03 omega omega-L})
 
 (defn- sym-covered-in-expr? [expr sym]
@@ -1072,6 +995,21 @@
   "When true, inject Emmy-validated analytical catalog blocks (circle, ellipse, Taylor, …)."
   false)
 
+(def ^:dynamic *primitive-tier*
+  "Graded pure-function extension: 0 = algebra only; 1..5 unlock Kepler pipeline stages."
+  0)
+
+(def primitive-use-rate
+  "Fraction of random GP trees that try one graded primitive call."
+  0.15)
+
+(defn current-primitive-tier [] (long *primitive-tier*))
+
+(defn unlocked-gp-primitive-ops
+  "Primitive ops available at the current tier (for MCTS / mutation)."
+  [tier]
+  (prims/unlocked-primitive-ops tier))
+
 (defn template-unbound-arms-active? []
   (and *template-unbound-arms?* *both-regimes?*))
 
@@ -1218,9 +1156,11 @@
 (defn- analytical-genome-valid? [ind]
   (let [chart (infer-law-chart ind)
         keys  (coords/analytical-expr-keys-for-chart chart)
-        required (coords/required-analytical-symbols-for-chart chart)]
+        required (coords/required-analytical-symbols-for-chart chart)
+        tier  (long *primitive-tier*)]
     (and (every? #(expr-uses-t? (get ind %)) keys)
          (symbols-covered-across-exprs? keys ind required)
+         (every? #(prims/expr-primitive-valid? (get ind %) tier) keys)
          (or (not *both-regimes?*)
              (analytical-strict-energy-branches? ind)))))
 
@@ -1657,6 +1597,24 @@
                    (if latex? (str "\\sinh\\left(" a "\\right)") (str "sinh(" a ")")))
           e/cosh (let [a (child (first args))]
                    (if latex? (str "\\cosh\\left(" a "\\right)") (str "cosh(" a ")")))
+          e/mean-anomaly
+          (let [a (child (first args)) b (child (second args)) c (child (nth args 2))]
+            (if latex? (str "M(" a "," b "," c ")") (str "mean-anomaly(" a "," b "," c ")")))
+          e/anomaly
+          (let [a (child (first args)) b (child (second args)) c (child (nth args 2))]
+            (if latex? (str "u(" a "," b "," c ")") (str "anomaly(" a "," b "," c ")")))
+          e/periapsis-xp
+          (let [s (clojure.string/join ", " (map child args))]
+            (if latex? (str "x'(" s ")") (str "periapsis-xp(" s ")")))
+          e/periapsis-yp
+          (let [s (clojure.string/join ", " (map child args))]
+            (if latex? (str "y'(" s ")") (str "periapsis-yp(" s ")")))
+          e/lab-qx
+          (let [s (clojure.string/join ", " (map child args))]
+            (if latex? (str "q_x^{\\mathrm{lab}}(" s ")") (str "lab-qx(" s ")")))
+          e/lab-qy
+          (let [s (clojure.string/join ", " (map child args))]
+            (if latex? (str "q_y^{\\mathrm{lab}}(" s ")") (str "lab-qy(" s ")")))
           e/div (let [a (child (first args)) b (child (second args))]
                   (if latex? (str "\\frac{" a "}{" b "}") (str "(" a " / " b ")")))
           e/if (let [[test then else] args
@@ -1780,9 +1738,10 @@
 ;; energy            — H(q₀,p₀); use with (e/if (neg? energy) bound-branch unbound-branch)
 ;; ecc, cos-om, sin-om, semi-a, semi-b, bh, n-mean — Kepler elements at t
 ;; kepler-u, kepler-F — eccentric/hyperbolic anomaly; kepler-xp/yp, kepler-vxp/vyp — periapsis frame
+;; kepler-M0, kepler-M — mean anomaly at IC and at t (graded primitive pipeline)
 (def analytical-derived-vars
   '[r0 r02 r03 r05 r06 omega omega-L energy
-    ecc cos-om sin-om semi-a semi-b bh n-mean
+    ecc cos-om sin-om semi-a semi-b bh n-mean kepler-M0 kepler-M
     kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp])
 (def analytical-vars (vec (concat '[t] ic-vars param-vars analytical-derived-vars)))
 (def differential-vars (vec (concat state-vars param-vars derived-vars)))
@@ -1805,26 +1764,35 @@
 (def unary-ops '#{e/square e/sin e/cos e/sinh e/cosh e/sqrt})
 (def ternary-ops '#{e/if})
 
+(defn- random-algebraic-expression
+  [depth vars]
+  (if (or (zero? depth) (< (rand) 0.3))
+    (random-atom vars)
+    (let [allowed (if (>= depth 2) ops (vec (remove #{'e/if} ops)))
+          op (rand-nth allowed)]
+      (cond
+        (= op 'e/if)
+        (list 'e/if '(neg? energy)
+              (random-algebraic-expression (dec depth) vars)
+              (random-algebraic-expression (dec depth) vars))
+
+        (unary-ops op)
+        (list op (random-algebraic-expression (dec depth) vars))
+
+        :else
+        (list op
+              (random-algebraic-expression (dec depth) vars)
+              (random-algebraic-expression (dec depth) vars))))))
+
 (defn random-expression
   ([depth] (random-expression depth analytical-vars))
   ([depth vars]
-   (if (or (zero? depth) (< (rand) 0.3))
-     (random-atom vars)
-     (let [allowed (if (>= depth 2) ops (vec (remove #{'e/if} ops)))
-           op (rand-nth allowed)]
-       (cond
-         (= op 'e/if)
-         (list 'e/if '(neg? energy)
-               (random-expression (dec depth) vars)
-               (random-expression (dec depth) vars))
-
-         (unary-ops op)
-         (list op (random-expression (dec depth) vars))
-
-         :else
-         (list op
-               (random-expression (dec depth) vars)
-               (random-expression (dec depth) vars)))))))
+   (if (and (pos? *primitive-tier*) (< (rand) primitive-use-rate))
+     (let [p (prims/random-primitive-expr *primitive-tier* vars (min 2 depth))]
+       (if (and p (prims/expr-primitive-valid? p *primitive-tier*))
+         p
+         (random-algebraic-expression depth vars)))
+     (random-algebraic-expression depth vars))))
 
 (defn- random-regime-branch-expr [depth vars]
   (list 'e/if '(neg? energy)
@@ -3741,6 +3709,7 @@
                :de-driven? false
                :both-regimes? false
                :domain-filter? false
+               :primitive-tier :auto
                :strategy nil}        ; nil = all strategies; or :analytical/:differential/:conserved
          xs args]
     (if (empty? xs)
@@ -3780,6 +3749,11 @@
           "--both-regimes" (recur (assoc opts :both-regimes? true) more)
           "--domain-filter" (recur (assoc opts :domain-filter? true) more)
           "--no-guess" (recur (assoc opts :guess-mutations? false) more)
+          "--primitive-tier"
+          (recur (assoc opts :primitive-tier
+                         (let [v (first more)]
+                           (if (= v "auto") :auto (Long/parseLong v))))
+                 (rest more))
           "--mcts-simulations" (recur (assoc opts :mcts-simulations (Long/parseLong (first more))) (rest more))
           "--mcts-inject" (recur (assoc opts :mcts-inject (Long/parseLong (first more))) (rest more))
           "--mcts-repair-simulations" (recur (assoc opts :mcts-repair-simulations (Long/parseLong (first more))) (rest more))
@@ -3915,7 +3889,8 @@
                 mcts-mutate? mcts-mutate-rate mcts-mutate-simulations
                 template-unbound-arms?
                 template-conic-unbound?
-                analytical-blocks?]}
+                analytical-blocks?
+                primitive-tier]}
         (parse-args args)
         de-driven? (= :de-driven (:evaluation fitness-context))
         both-regimes-on? (or both-regimes?
@@ -3930,7 +3905,14 @@
                                 analytical-blocks-on? (blocks/kepler-conic-valid?))
         report-scenarios default-scenarios
         ref-datasets (scenarios->datasets report-scenarios)
-        preferred-chart (coords/dominant-chart ref-datasets)]
+        preferred-chart (coords/dominant-chart ref-datasets)
+        primitive-tier-on? (and de-driven? (= strategy :analytical))
+        initial-primitive-tier (if primitive-tier-on?
+                                 (if (= primitive-tier :auto)
+                                   0
+                                   (long primitive-tier))
+                                 0)
+        primitive-tier-atom (atom initial-primitive-tier)]
   (binding [*strategy-filter* strategy
             *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)
             *de-driven-search?* de-driven?
@@ -3938,6 +3920,7 @@
             *template-unbound-arms?* template-unbound-on?
             *template-conic-unbound?* template-conic-on?
             *analytical-blocks?* analytical-blocks-on?
+            *primitive-tier* initial-primitive-tier
             *mcts-mutate?* mcts-mutate-on?
             *mcts-mutate-rate* mcts-mutate-rate
             *mcts-mutate-simulations* mcts-mutate-simulations
@@ -3974,6 +3957,11 @@
                   (blocks/catalog-block-count)
                   " catalog laws + kepler-conic inject"
                   " — circle, ellipse, harmonic, conic (sinh/cosh)")))
+  (when (and primitive-tier-on? (pos? initial-primitive-tier))
+    (println (str "Graded primitives: tier " initial-primitive-tier
+                  " — " (clojure.string/join ", " (map name (prims/unlocked-primitive-ops initial-primitive-tier))))))
+  (when (and primitive-tier-on? (= primitive-tier :auto))
+    (println "Graded primitives: tier auto (unlocks with hall-of-fame fitness)"))
   (let [{:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
                                      :seed?  seed?
@@ -4092,6 +4080,7 @@
                            pop' (binding [*stagnation-escape?* (or escape-burst? escape-deep?)
                                           *fast-breeding?* (or escape-burst? escape-deep?)
                                           *fast-immigrants?* (or escape-burst? escape-deep?)
+                                          *primitive-tier* @primitive-tier-atom
                                           *fitness-timeout-ms* (when (or escape-burst? escape-deep?)
                                                                  90000)]
                                   (evolve-generation pop-for-breed fitness-context population-size gen-idx
@@ -4126,6 +4115,10 @@
                                         (or (nil? @hall-of-fame)
                                             (> eval-best (:eval-fitness @hall-of-fame))))
                                (reset! hall-of-fame {:ind best-eval-ind :eval-fitness eval-best}))
+                           _ (when (and primitive-tier-on? (= primitive-tier :auto))
+                               (reset! primitive-tier-atom
+                                       (prims/primitive-tier-for-hof
+                                        (or (:eval-fitness @hall-of-fame) eval-best 0.0))))
                            ;; Update stagnation counter.
                            _ (if (> (or (:eval-fitness @hall-of-fame) 0.0) prev-hof-fitness)
                                (do (reset! stagnation 0)

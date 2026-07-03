@@ -4,7 +4,8 @@
   (:require [clojure.walk :as walk]
             [emmy.abstract.number :as an]
             [emmy.expression :as ex]
-            [emmy.generic :as g]))
+            [emmy.generic :as g]
+            [evophy.primitives :as prims]))
 
 (def ^:private emmy-sym (comp an/literal-number symbol))
 
@@ -85,6 +86,8 @@
   (try
     (cond
       (or (number? expr) (symbol? expr)) true
+      (and (sequential? expr) (seq expr) (prims/primitive-op? (first expr)))
+      (every? symbolic-validate-expr? (rest expr))
       (and (sequential? expr) (= 'e/if (first expr)))
       (and (= 4 (count expr))
            (= '(neg? energy) (second expr))

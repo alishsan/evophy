@@ -2,7 +2,8 @@
   "MCTS builds analytical genomes; GP selects and mutates each generation.
 
   Search can stop early (Ctrl+C or [[request-stop!]]) and return the best genome found so far."
-  (:require [evophy.core :as core])
+  (:require [evophy.core :as core]
+            [evophy.primitives :as prims])
   (:import (sun.misc Signal SignalHandler)))
 
 (def ^:private hole '__hole__)
@@ -78,9 +79,12 @@
 
 (defn- legal-actions [depth vars]
   (let [terminals (for [s (concat vars core/constants)] [:term s])
+        prim-ops  (for [op (core/unlocked-gp-primitive-ops (core/current-primitive-tier))]
+                    [:primitive op (prims/primitive-arity op)])
         ops (if (or (zero? depth) (< (rand) 0.3))
-              []
-              (concat (for [op core/unary-ops] [:unary op])
+              prim-ops
+              (concat prim-ops
+                      (for [op core/unary-ops] [:unary op])
                       (for [op core/ops
                             :when (not (contains? core/unary-ops op))]
                         [:binary op])))]
@@ -88,9 +92,12 @@
 
 (defn- legal-actions-deterministic [depth vars]
   (let [terminals (for [s (concat vars core/constants)] [:term s])
+        prim-ops  (for [op (core/unlocked-gp-primitive-ops (core/current-primitive-tier))]
+                    [:primitive op (prims/primitive-arity op)])
         ops (if (zero? depth)
-              []
-              (concat (for [op core/unary-ops] [:unary op])
+              prim-ops
+              (concat prim-ops
+                      (for [op core/unary-ops] [:unary op])
                       (for [op core/ops
                             :when (not (contains? core/unary-ops op))]
                         [:binary op])))]
@@ -100,7 +107,10 @@
   (case (first action)
     :term (replace-at-path expr path (second action))
     :unary (replace-at-path expr path (list (second action) hole))
-    :binary (replace-at-path expr path (list (second action) hole hole))))
+    :binary (replace-at-path expr path (list (second action) hole hole))
+    :primitive (replace-at-path expr path
+                               (apply list (second action)
+                                      (repeatedly (nth action 2) (constantly hole))))))
 
 (defn- complete-expr [expr vars]
   (if-let [path (find-hole-path expr)]
