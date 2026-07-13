@@ -15,14 +15,17 @@
 
 (defn- print-individual [i ind datasets]
   (try
-    (let [eq      (c/individual->equations ind :format :plain)
+    (let [law     (c/first-law-legacy ind)
+          eq      (c/individual->equations law :format :plain)
           metrics (:metrics eq)
           metric-label "mse"
           metric-val   (format "%.6f" (double (:mse metrics)))]
       (println (str "#" (inc i)
-                    "  strategy=" (name (:strategy eq))
+                    "  strategy=" (name (c/primary-strategy-label ind))
                     "  " metric-label "=" metric-val
                     "  fitness=" (format "%.4f" (:fitness ind))))
+      (when (> (count (c/individual-laws ind)) 1)
+        (println (str "    laws=" (pr-str (c/individual-law-kinds ind)))))
       (doseq [[_ line] (sort-by key (:equations eq))]
         (println (str "    " line)))
       (println))
@@ -60,12 +63,12 @@
           ;; Then take top-N per strategy from the de-duped list.
           deduped  (distinct ranked)
           top-all  (take top-n deduped)
-          top-diff (take top-n (filter #(= :differential (:strategy %)) deduped))
-          top-anal (take top-n (filter #(= :analytical   (:strategy %)) deduped))
-          top-cons (take top-n (filter #(= :conserved    (:strategy %)) deduped))]
+          top-comp (take top-n (filter #(= :composite (c/primary-strategy-label %)) deduped))
+          top-anal (take top-n (filter #(= :analytical (c/primary-strategy-label %)) deduped))
+          top-cons (take top-n (filter #(= :conserved  (c/primary-strategy-label %)) deduped))]
       (println (str "Loaded " total
                     " individuals  |  total generations: " (:generations-run loaded) "\n"))
       (print-section (str "Top " top-n " overall (any strategy)") top-all  datasets)
-      (print-section (str "Top " top-n " differential")           top-diff datasets)
+      (print-section (str "Top " top-n " composite")              top-comp datasets)
       (print-section (str "Top " top-n " conserved quantities")   top-cons datasets)
       (print-section (str "Top " top-n " analytical")             top-anal datasets))))

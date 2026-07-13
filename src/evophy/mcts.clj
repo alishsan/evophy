@@ -155,7 +155,7 @@
 (defn- state-action-pairs [state]
   (when-let [path (find-hole-path (current-expr state))]
     (let [depth (depth-at-hole (current-expr state) path)
-          vars core/analytical-vars]
+          vars (core/analytical-gp-vars)]
       (map (fn [action] {:path path :action action})
            (legal-actions depth vars)))))
 
@@ -170,7 +170,7 @@
       s
       (if-let [pairs (seq (state-action-pairs s))]
         (recur (apply-state-action s (rand-nth pairs)))
-        (let [vars core/analytical-vars]
+        (let [vars (core/analytical-gp-vars)]
           (recur (into (assoc s :phase :done)
                        (map (fn [k] [k (complete-expr (get s k) vars)])
                             core/analytical-expr-keys))))))))
@@ -349,7 +349,7 @@
   (when-let [path (find-hole-path (get state (:repair-key state)))]
     (let [expr (get state (:repair-key state))
           depth (depth-at-hole expr path)
-          vars core/analytical-vars]
+          vars (core/analytical-gp-vars)]
       (map (fn [action] {:path path :action action})
            (legal-actions depth vars)))))
 
@@ -364,7 +364,7 @@
   (if (repair-terminal? state)
     state
     (let [expr-key (:repair-key state)
-          vars core/analytical-vars
+          vars (core/analytical-gp-vars)
           expr (or (complete-expr-deterministic (get state expr-key) vars)
                    (get state expr-key))]
       (assoc state expr-key expr))))

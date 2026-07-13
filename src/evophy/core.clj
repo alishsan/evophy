@@ -185,34 +185,34 @@
      :px (+ px' (* (:dpx d3) half))
      :py (+ py' (* (:dpy d3) half))}))
 
-;; ── Exact Keplerian solver ────────────────────────────────────────────────
+;; ── Exact conic orbit oracle ────────────────────────────────────────────────
 ;; Unified complex oracle in evophy.primitives (M = u − e·sin u, n = (−2E)^(3/2)/(α√m)).
 
-(defn- kepler-orbit-nan []
-  (prims/kepler-orbit-nan))
+(defn- orbit-nan []
+  (prims/orbit-nan))
 
-(defn- kepler-orbit-at-t
+(defn- orbit-at-t
   [m alpha q0x q0y p0x p0y t]
-  (prims/kepler-orbit-at-t m alpha q0x q0y p0x p0y t))
+  (prims/orbit-at-t m alpha q0x q0y p0x p0y t))
 
-(defn- kepler-state-at-t
+(defn- orbit-state-at-t
   "Exact Keplerian (qx, qy, px, py) at time t via orbital elements.
    Handles elliptic (E < 0) and hyperbolic (E > 0).
    Returns nil for degenerate orbits (radial: |L| < 1e-8; near-parabolic: |e−1| < 1e-5)
    so callers can fall back to numerical integration."
   [m alpha q0x q0y p0x p0y t]
-  (when-let [{:keys [qx qy px py]} (kepler-orbit-at-t m alpha q0x q0y p0x p0y t)]
+  (when-let [{:keys [qx qy px py]} (orbit-at-t m alpha q0x q0y p0x p0y t)]
     (when (and (Double/isFinite (double qx)) (Double/isFinite (double qy)))
       {:qx qx :qy qy :px px :py py})))
 
 (defn generate-data [m alpha q0x q0y p0x p0y dt steps]
   (let [ic           {:qx (double q0x) :qy (double q0y) :px (double p0x) :py (double p0y)}
-        use-kepler?  (some? (kepler-state-at-t m alpha q0x q0y p0x p0y 0.0))]
-    (if use-kepler?
+        use-orbit-oracle?  (some? (orbit-state-at-t m alpha q0x q0y p0x p0y 0.0))]
+    (if use-orbit-oracle?
       ;; Exact analytic Keplerian states — no drift across any number of periods.
       (mapv (fn [n]
               (let [ti (* (double dt) n)
-                    s  (kepler-state-at-t m alpha q0x q0y p0x p0y ti)]
+                    s  (orbit-state-at-t m alpha q0x q0y p0x p0y ti)]
                 (assoc s :t ti :energy (grav2d-energy m alpha s))))
             (range (inc steps)))
       ;; Fallback: symplectic ODE integration for degenerate cases (radial / near-parabolic).
@@ -502,22 +502,22 @@
                                      ~'omega-L (/ (- (* ~'q0x ~'p0y) (* ~'q0y ~'p0x))
                                                   (* ~'m ~'r02))
                                      ~'energy (grav2d-energy ~'m ~'alpha {:qx ~'q0x :qy ~'q0y :px ~'p0x :py ~'p0y})
-                                     ~'kepler (kepler-orbit-at-t ~'m ~'alpha ~'q0x ~'q0y ~'p0x ~'p0y ~'t)
-                                     ~'kepler-M0 (prims/M0-at-ic ~'m ~'alpha ~'q0x ~'q0y ~'p0x ~'p0y)
-                                     ~'ecc       (:ecc ~'kepler)
-                                     ~'cos-om    (:cos-om ~'kepler)
-                                     ~'sin-om    (:sin-om ~'kepler)
-                                     ~'semi-a    (:semi-a ~'kepler)
-                                     ~'semi-b    (:semi-b ~'kepler)
-                                     ~'bh        (:bh ~'kepler)
-                                     ~'n-mean    (:n-mean ~'kepler)
-                                     ~'kepler-M  (+ ~'kepler-M0 (* ~'n-mean ~'t))
-                                     ~'kepler-u  (:kepler-u ~'kepler)
-                                     ~'kepler-F  (:kepler-F ~'kepler)
-                                     ~'kepler-xp (:kepler-xp ~'kepler)
-                                     ~'kepler-yp (:kepler-yp ~'kepler)
-                                     ~'kepler-vxp (:kepler-vxp ~'kepler)
-                                     ~'kepler-vyp (:kepler-vyp ~'kepler)]
+                                     ~'orbit (orbit-at-t ~'m ~'alpha ~'q0x ~'q0y ~'p0x ~'p0y ~'t)
+                                     ~'mean-M0 (prims/M0-at-ic ~'m ~'alpha ~'q0x ~'q0y ~'p0x ~'p0y)
+                                     ~'ecc       (:ecc ~'orbit)
+                                     ~'cos-om    (:cos-om ~'orbit)
+                                     ~'sin-om    (:sin-om ~'orbit)
+                                     ~'semi-a    (:semi-a ~'orbit)
+                                     ~'semi-b    (:semi-b ~'orbit)
+                                     ~'bh        (:bh ~'orbit)
+                                     ~'n-mean    (:n-mean ~'orbit)
+                                     ~'mean-M  (+ ~'mean-M0 (* ~'n-mean ~'t))
+                                     ~'ecc-anom  (:ecc-anom ~'orbit)
+                                     ~'hyp-anom  (:hyp-anom ~'orbit)
+                                     ~'peri-xp (:peri-xp ~'orbit)
+                                     ~'peri-yp (:peri-yp ~'orbit)
+                                     ~'peri-vxp (:peri-vxp ~'orbit)
+                                     ~'peri-vyp (:peri-vyp ~'orbit)]
                                  (safe-double
                                   ~(prepare-expr-for-compile expr)))))))))
 
@@ -641,15 +641,18 @@
                pred-r (safe-double (r-fn td r0 theta0 pr0 ptheta0 md ad))
                pred-th (safe-double (theta-fn td r0 theta0 pr0 ptheta0 md ad))
                pred-pr (safe-double (pr-fn td r0 theta0 pr0 ptheta0 md ad))
-               pred-pt (safe-double (ptheta-fn td r0 theta0 pr0 ptheta0 md ad))]
-           (-> acc
-               (update :sq-q + (+ (e/square (- pred-r r))
-                                  (e/square (- pred-th theta))))
-               (update :sq-p + (+ (e/square (- pred-pr pr))
-                                  (e/square (- pred-pt ptheta))))
-               (update :n inc)))
+               pred-pt (safe-double (ptheta-fn td r0 theta0 pr0 ptheta0 md ad))
+               qerr (+ (e/square (- pred-r r)) (e/square (- pred-th theta)))
+               perr (+ (e/square (- pred-pr pr)) (e/square (- pred-pt ptheta)))
+               acc  (update acc :attempted inc)]
+           (if (and (Double/isFinite qerr) (Double/isFinite perr))
+             (-> acc
+                 (update :sq-q + qerr)
+                 (update :sq-p + perr)
+                 (update :n inc))
+             acc))
          acc))
-     {:sq-q 0.0 :sq-p 0.0 :n 0}
+     {:sq-q 0.0 :sq-p 0.0 :n 0 :attempted 0}
      horizon-times)))
 
 (defn- horizon-errors-analytical [fns dataset horizon-times]
@@ -667,15 +670,18 @@
                  pred-qx (safe-double (qx-fn td q0x q0y p0x p0y md ad))
                  pred-qy (safe-double (qy-fn td q0x q0y p0x p0y md ad))
                  pred-px (safe-double (px-fn td q0x q0y p0x p0y md ad))
-                 pred-py (safe-double (py-fn td q0x q0y p0x p0y md ad))]
-             (-> acc
-                 (update :sq-q + (+ (e/square (- pred-qx qx))
-                                      (e/square (- pred-qy qy))))
-                 (update :sq-p + (+ (e/square (- pred-px px))
-                                      (e/square (- pred-py py))))
-                 (update :n inc)))
+                 pred-py (safe-double (py-fn td q0x q0y p0x p0y md ad))
+                 qerr (+ (e/square (- pred-qx qx)) (e/square (- pred-qy qy)))
+                 perr (+ (e/square (- pred-px px)) (e/square (- pred-py py)))
+                 acc  (update acc :attempted inc)]
+             (if (and (Double/isFinite qerr) (Double/isFinite perr))
+               (-> acc
+                   (update :sq-q + qerr)
+                   (update :sq-p + perr)
+                   (update :n inc))
+               acc))
            acc))
-       {:sq-q 0.0 :sq-p 0.0 :n 0}
+       {:sq-q 0.0 :sq-p 0.0 :n 0 :attempted 0}
        horizon-times))))
 
 (defn- symplectic-step-rates
@@ -750,13 +756,13 @@
     (coll? expr) (boolean (some #(expr-uses-symbol? % sym) expr))
     :else false))
 
-(def ^:private kepler-time-proxy-syms
-  "Kepler derived vars computed from t in compile-state-fn — satisfy trajectory-in-t checks."
-  '#{kepler-u kepler-F kepler-M kepler-xp kepler-yp kepler-vxp kepler-vyp})
+(def ^:private orbit-time-proxy-syms
+  "Orbit derived vars computed from t in compile-state-fn — satisfy trajectory-in-t checks."
+  '#{ecc-anom hyp-anom mean-M peri-xp peri-yp peri-vxp peri-vyp})
 
 (defn expr-uses-t? [expr]
   (or (expr-uses-symbol? expr 't)
-      (some #(expr-uses-symbol? expr %) kepler-time-proxy-syms)))
+      (some #(expr-uses-symbol? expr %) orbit-time-proxy-syms)))
 
 (def analytical-expr-keys    [:qx-expr :qy-expr :px-expr :py-expr])
 (def differential-expr-keys  [:dqx-expr :dqy-expr :dpx-expr :dpy-expr])
@@ -835,8 +841,8 @@
 
 (def ^:private ic-proxy-syms
   "Orbit elements derived from ICs in compile-state-fn — cover q0x/q0y mandate for Kepler laws."
-  '#{ecc cos-om sin-om semi-a semi-b bh n-mean kepler-M0
-    kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp kepler-M
+  '#{ecc cos-om sin-om semi-a semi-b bh n-mean mean-M0
+    ecc-anom hyp-anom peri-xp peri-yp peri-vxp peri-vyp mean-M
     r0 r02 r03 omega omega-L})
 
 (defn- sym-covered-in-expr? [expr sym]
@@ -946,12 +952,6 @@
           (map (fn [k] [k (regime-arm-expr (get leg k) regime)])
                keys))))
 
-(defn- analytical-slice-valid? [ind chart]
-  (let [keys     (coords/analytical-expr-keys-for-chart chart)
-        required (coords/required-analytical-symbols-for-chart chart)]
-    (and (every? #(expr-uses-t? (get ind %)) keys)
-         (symbols-covered-across-exprs? keys ind required))))
-
 (defn analytical-branches-on-energy?
   "True when any analytical slot uses (e/if (neg? energy) bound-branch unbound-branch)."
   [law]
@@ -999,9 +999,22 @@
   "Graded pure-function extension: 0 = algebra only; 1..5 unlock Kepler pipeline stages."
   0)
 
+(def ^:dynamic *primitive-pipeline-only?*
+  "When true: tier 5, no oracle leaf symbols in GP (ecc-anom/F/M/xp/yp); no conic catalog/template."
+  false)
+
+(def primitive-pipeline-tier 5)
+
 (def primitive-use-rate
   "Fraction of random GP trees that try one graded primitive call."
   0.15)
+
+(def primitive-pipeline-use-rate
+  "Primitive sampling rate in --primitive-pipeline-only mode."
+  0.55)
+
+(defn primitive-pipeline-only-active? []
+  *primitive-pipeline-only?*)
 
 (defn current-primitive-tier [] (long *primitive-tier*))
 
@@ -1011,10 +1024,23 @@
   (prims/unlocked-primitive-ops tier))
 
 (defn template-unbound-arms-active? []
-  (and *template-unbound-arms?* *both-regimes?*))
+  (and *template-unbound-arms?* *both-regimes?* (not (primitive-pipeline-only-active?))))
 
 (defn- analytical-blocks-active? []
-  (and *analytical-blocks?* *both-regimes?*))
+  (and *analytical-blocks?* *both-regimes?* (not (primitive-pipeline-only-active?))))
+
+(defn- graded-pipeline-analytical-exprs []
+  (into {}
+        (map (fn [k] [k (prims/graded-pipeline-expr k)])
+             cartesian-analytical-expr-keys)))
+
+(defn- graded-pipeline-analytical-individual []
+  (let [base (into {:strategy :analytical
+                     :domain (if *both-regimes?* :any :bound)}
+                   (graded-pipeline-analytical-exprs))]
+    (if *both-regimes?*
+      (wrap-analytical-energy-branches base :unbound-exprs base)
+      base)))
 
 (defn template-conic-unbound-active? []
   (and *template-conic-unbound?* (template-unbound-arms-active?) (analytical-blocks-active?)))
@@ -1057,51 +1083,34 @@
   [expr-key unbound-expr]
   (list 'e/if '(neg? energy) (bound-arm-expr expr-key) unbound-expr))
 
-(defn- wrap-kepler-conic-strict
-  "Both-regimes strict shell: :ellipse-conic bound + :hyperbola-conic unbound."
-  [entry]
-  (into {:strategy :analytical :domain :any}
-        (map (fn [k]
-               [k (list 'e/if '(neg? energy)
-                        (get (:bound-slots entry) k)
-                        (get (:unbound-slots entry) k))])
-             cartesian-analytical-expr-keys)))
-
 (defn- wrap-catalog-entry-strict
   "Strict e/if shell for one catalog entry (bound → template unbound; unbound → Taylor bound)."
   [entry]
-  (cond
-    (= :kepler-conic (:id entry))
-    (wrap-kepler-conic-strict entry)
+  (let [regime (:regime entry :bound)
+        slots  (:slots entry)
+        leg    (into {:strategy :analytical
+                      :domain (if *both-regimes?* :any (blocks/regime->domain regime))}
+                     slots)]
+    (cond
+      (not *both-regimes?*)
+      leg
 
-    :else
-    (let [regime (:regime entry :bound)
-          slots  (:slots entry)
-          leg    (into {:strategy :analytical
-                        :domain (if *both-regimes?* :any (blocks/regime->domain regime))}
-                       slots)]
-      (cond
-        (not *both-regimes?*)
-        leg
+      (= regime :unbound)
+      (into leg
+            (map (fn [k] [k (slot-with-unbound-arm k (get slots k))])
+                 cartesian-analytical-expr-keys))
 
-        (= regime :unbound)
-        (into leg
-              (map (fn [k] [k (slot-with-unbound-arm k (get slots k))])
-                   cartesian-analytical-expr-keys))
+      (template-unbound-arms-active?)
+      (template-unbound-arms-law
+       (into leg
+             (map (fn [k] [k (slot-with-bound-arm k (get slots k))])
+                  cartesian-analytical-expr-keys)))
 
-        (template-unbound-arms-active?)
-        (template-unbound-arms-law
-         (into leg
-               (map (fn [k] [k (slot-with-bound-arm k (get slots k))])
-                    cartesian-analytical-expr-keys)))
-
-        :else
-        (wrap-analytical-energy-branches leg)))))
+      :else
+      (wrap-analytical-energy-branches leg))))
 
 (defn- catalog-law-as-individual []
-  (if (and (template-conic-unbound-active?) (blocks/kepler-conic-valid?) (< (rand) 0.40))
-    (wrap-kepler-conic-strict (blocks/kepler-conic-entry))
-    (wrap-catalog-entry-strict (blocks/random-catalog-entry))))
+  (wrap-catalog-entry-strict (blocks/random-catalog-entry)))
 
 (defn- strict-catalog-law-from-entry [entry]
   (wrap-catalog-entry-strict entry))
@@ -1157,10 +1166,21 @@
   (let [chart (infer-law-chart ind)
         keys  (coords/analytical-expr-keys-for-chart chart)
         required (coords/required-analytical-symbols-for-chart chart)
-        tier  (long *primitive-tier*)]
+        tier  (long *primitive-tier*)
+        pipeline? (primitive-pipeline-only-active?)]
     (and (every? #(expr-uses-t? (get ind %)) keys)
          (symbols-covered-across-exprs? keys ind required)
          (every? #(prims/expr-primitive-valid? (get ind %) tier) keys)
+         (or (not pipeline?)
+             (and (every? #(let [ex (get ind %)]
+                              (and (pos? (prims/expr-primitive-depth ex))
+                                   (not (prims/expr-uses-forbidden-oracle-leaf?
+                                         ex (prims/pipeline-only-forbidden-syms %)))))
+                          [:qx-expr :qy-expr])
+                  (every? #(not (prims/expr-uses-forbidden-oracle-leaf?
+                                  (get ind %)
+                                  (prims/pipeline-only-forbidden-syms %)))
+                          keys)))
          (or (not *both-regimes?*)
              (analytical-strict-energy-branches? ind)))))
 
@@ -1737,13 +1757,25 @@
 ;; omega-L           — actual initial angular velocity (q×p)/(m·r₀²); valid for any orbit
 ;; energy            — H(q₀,p₀); use with (e/if (neg? energy) bound-branch unbound-branch)
 ;; ecc, cos-om, sin-om, semi-a, semi-b, bh, n-mean — Kepler elements at t
-;; kepler-u, kepler-F — eccentric/hyperbolic anomaly; kepler-xp/yp, kepler-vxp/vyp — periapsis frame
-;; kepler-M0, kepler-M — mean anomaly at IC and at t (graded primitive pipeline)
+;; ecc-anom, hyp-anom — eccentric/hyperbolic anomaly; peri-xp/yp, peri-vxp/vyp — periapsis frame
+;; mean-M0, mean-M — mean anomaly at IC and at t (graded primitive pipeline)
 (def analytical-derived-vars
   '[r0 r02 r03 r05 r06 omega omega-L energy
-    ecc cos-om sin-om semi-a semi-b bh n-mean kepler-M0 kepler-M
-    kepler-u kepler-F kepler-xp kepler-yp kepler-vxp kepler-vyp])
+    ecc cos-om sin-om semi-a semi-b bh n-mean mean-M0 mean-M
+    ecc-anom hyp-anom peri-xp peri-yp peri-vxp peri-vyp])
 (def analytical-vars (vec (concat '[t] ic-vars param-vars analytical-derived-vars)))
+
+(defn- gp-analytical-derived-vars []
+  (if (primitive-pipeline-only-active?)
+    (vec (remove #(contains? (into prims/oracle-anomaly-leaf-syms
+                                  prims/oracle-mean-leaf-syms)
+                             %)
+                 analytical-derived-vars))
+    analytical-derived-vars))
+
+(defn analytical-gp-vars []
+  (vec (concat '[t] ic-vars param-vars (gp-analytical-derived-vars))))
+
 (def differential-vars (vec (concat state-vars param-vars derived-vars)))
 
 ;; Variables for conserved-quantity expressions: current state, params, and
@@ -1785,14 +1817,18 @@
               (random-algebraic-expression (dec depth) vars))))))
 
 (defn random-expression
-  ([depth] (random-expression depth analytical-vars))
+  ([depth] (random-expression depth (analytical-gp-vars)))
   ([depth vars]
-   (if (and (pos? *primitive-tier*) (< (rand) primitive-use-rate))
-     (let [p (prims/random-primitive-expr *primitive-tier* vars (min 2 depth))]
-       (if (and p (prims/expr-primitive-valid? p *primitive-tier*))
-         p
-         (random-algebraic-expression depth vars)))
-     (random-algebraic-expression depth vars))))
+   (let [pipeline? (primitive-pipeline-only-active?)
+         tier      (long *primitive-tier*)
+         use-rate  (if pipeline? primitive-pipeline-use-rate primitive-use-rate)]
+     (if (and (pos? tier) (< (rand) use-rate))
+       (let [p (prims/random-primitive-expr tier vars (min 2 depth)
+                                            :pipeline-only? pipeline?)]
+         (if (and p (prims/expr-primitive-valid? p tier))
+           p
+           (random-algebraic-expression depth vars)))
+       (random-algebraic-expression depth vars)))))
 
 (defn- random-regime-branch-expr [depth vars]
   (list 'e/if '(neg? energy)
@@ -1805,17 +1841,25 @@
                   (ensure-symbol-coverage expr-keys required-syms))]
       (cond
         (valid?-fn ind) ind
-        (> n 500) (if *both-regimes?*
+        (> n 500) (cond
+                    (primitive-pipeline-only-active?)
+                    ind
+
+                    *both-regimes?*
                     (wrap-analytical-energy-branches
                      (into {:strategy :analytical :domain :any}
                            unbound-linear-analytical-exprs))
-                    ind)
+
+                    :else ind)
         :else (recur (inc n))))))
 
 (defn random-analytical-individual
   ([] (random-analytical-individual (or *preferred-law-chart* :cartesian)))
   ([chart]
-   (if (and (analytical-blocks-active?) (= chart :cartesian) (< (rand) 0.45))
+   (or (when (and (primitive-pipeline-only-active?) (< (rand) 0.0))
+         (let [ind (graded-pipeline-analytical-individual)]
+           (when (analytical-genome-valid? ind) ind)))
+       (if (and (analytical-blocks-active?) (= chart :cartesian) (< (rand) 0.45))
      (catalog-law-as-individual)
      (let [chart    (keyword chart)
          keys     (coords/analytical-expr-keys-for-chart chart)
@@ -1824,7 +1868,7 @@
                                param-vars
                                (if (= :polar chart)
                                  '[r02 r03 omega omega-L energy]
-                                 analytical-derived-vars)))
+                                 (gp-analytical-derived-vars))))
          required (coords/required-analytical-symbols-for-chart chart)
          ensure-t (fn [ind]
                     (into ind
@@ -1852,7 +1896,10 @@
            (cond-> (= chart :polar) ensure-t))
       keys
       required
-      analytical-genome-valid?)))))
+      analytical-genome-valid?))))))
+
+(defn- pipeline-only-seeds []
+  [(laws-individual [(graded-pipeline-analytical-individual)])])
 
 (defn random-differential-individual []
   (random-valid-individual
@@ -2246,8 +2293,8 @@
     (catch Exception _ 0)))
 
 (def ^:dynamic *strategy-filter*
-  "When set to a keyword (:analytical, :differential, :conserved), random-individual
-   generates only that strategy.  nil (default) = uniform mix of all three."
+  "When set to a keyword (:analytical or :conserved), random-individual generates
+   only that strategy. nil (default) = composite analytical + conserved."
   nil)
 
 (def ^:dynamic *fast-immigrants?*
@@ -2259,7 +2306,7 @@
   false)
 
 (def ^:dynamic *de-driven-search?*
-  "When true, immigrants and default strategy mix exclude :differential (redundant with known ODE)."
+  "When true, fitness uses the physics-driven analytical/conserved scoring path."
   false)
 
 (def default-mcts-mutate-rate 0.2)
@@ -2285,10 +2332,12 @@
   (law-from-legacy
    (case kind
      :analytical   (random-analytical-individual)
-     :differential (random-differential-individual)
      :conserved    (if *fast-immigrants?*
                       (random-conserved-individual {:strict? false :max-tries 25})
-                      (random-conserved-individual)))))
+                      (random-conserved-individual))
+     (throw (ex-info "Unknown evolutionary strategy"
+                     {:strategy kind
+                      :allowed #{:analytical :conserved}})))))
 
 (defn- random-composite-de-individual []
   (laws-individual [(random-analytical-individual)
@@ -2296,33 +2345,26 @@
 
 (defn random-individual []
   (cond
-    ;; DE-driven: one genome with analytical trajectories + a conserved invariant.
-    (and *de-driven-search?*
-         (or (nil? *strategy-filter*)
-             (= *strategy-filter* :conserved)))
+    ;; Default: one genome with analytical trajectories + a conserved invariant.
+    (nil? *strategy-filter*)
     (random-composite-de-individual)
 
-    (and *de-driven-search?* (= *strategy-filter* :analytical))
+    (= *strategy-filter* :analytical)
     (laws-individual [(random-law :analytical)])
 
-    *strategy-filter*
-    (laws-individual [(random-law *strategy-filter*)])
+    (= *strategy-filter* :conserved)
+    (laws-individual [(random-law :conserved)])
 
     :else
-    (laws-individual
-     [(random-law
-       (let [r (rand)]
-         (cond
-           (< r 0.34) :analytical
-           (< r 0.67) :differential
-           :else :conserved)))])))
+    (throw (ex-info "Unknown evolutionary strategy"
+                    {:strategy *strategy-filter*
+                     :allowed #{:analytical :conserved}}))))
 
 (defn- escape-deep-reseed-population
   "Full population for [escape+]: cycle validated catalog laws (strict template), else random."
   [n]
   (if (and (= *strategy-filter* :analytical) (analytical-blocks-active?))
-    (let [entries (cond-> (vec blocks/validated-catalog)
-                    (blocks/kepler-conic-valid?) (conj (blocks/kepler-conic-entry)))
+    (let [entries (vec blocks/validated-catalog)
           inds (mapv #(laws-individual [(law-from-legacy (strict-catalog-law-from-entry %))])
                      entries)]
       (if (seq inds)
@@ -2519,19 +2561,24 @@
                     (double n))))))
 
 (defn- fitness-from-errors
-  "fitness = 1 / (RMSE/D + 1)  where D is the characteristic position scale.
+  "fitness = coverage * 1 / (RMSE/D + 1)  where D is the characteristic position scale
+   and coverage = (finite samples) / (attempted samples) — a single non-finite sample
+   (e.g. sqrt of a negative from a mistyped argument) no longer poisons the whole
+   trajectory's score; it only discounts fitness by how much of the horizon was unusable.
    Result is dimensionless and bounded in (0, 1]; returns 0 for degenerate inputs."
-  [{:keys [sq-q sq-p n]} D]
+  [{:keys [sq-q sq-p n attempted]} D]
   (if (or (zero? n) (<= (double D) 0.0))
     0.0
     (let [n (double n)
+          attempted (double (or attempted n))
           sum-sq (+ sq-q sq-p)]
       (if (or (Double/isNaN sum-sq) (Double/isInfinite sum-sq))
         0.0
         (let [rmse (Math/sqrt (/ sum-sq n))]
           (if (Double/isNaN rmse)
             0.0
-            (/ 1.0 (+ (/ rmse (double D)) 1.0))))))))
+            (* (/ n attempted)
+               (/ 1.0 (+ (/ rmse (double D)) 1.0)))))))))
 
 (declare calculate-analytical-slice-fitness-at-horizon)
 
@@ -2664,20 +2711,20 @@
         (throw (ex-info "Unknown fitness aggregate" {:aggregate aggregate}))))))
 
 (defn- calculate-analytical-slice-fitness-at-horizon
-  "Fitness for a regime-sliced law (arms only, no outer e/if) on one scenario."
+  "Fitness for a regime-sliced law (arms only, no outer e/if) on one scenario.
+   A degenerate arm (e.g. a constant) is judged purely by how badly it fits the real
+   trajectory, not banned outright — see fitness-from-errors."
   [ind dataset horizon-frac]
   (try
     (let [chart (analytical-fitness-chart ind dataset)]
-      (if-not (analytical-slice-valid? ind chart)
+      (if-not (coords/analytical-exprs-present? ind chart)
         0.0
-        (if-not (coords/analytical-exprs-present? ind chart)
-          0.0
-          (let [{:keys [data]} dataset
-                D    (char-scale data)
-                fns  (compile-analytical-fns ind chart)
-                ds   (assoc dataset :chart chart)
-                errors (horizon-errors-analytical fns ds (horizon-fraction-times data horizon-frac))]
-            (fitness-from-errors errors D)))))
+        (let [{:keys [data]} dataset
+              D    (char-scale data)
+              fns  (compile-analytical-fns ind chart)
+              ds   (assoc dataset :chart chart)
+              errors (horizon-errors-analytical fns ds (horizon-fraction-times data horizon-frac))]
+          (fitness-from-errors errors D))))
     (catch Exception _ 0.0)))
 
 (defn- calculate-analytical-slice-fitness
@@ -2918,7 +2965,7 @@
      :else expr)))
 
 (defn mutate
-  ([expr] (mutate expr analytical-vars))
+  ([expr] (mutate expr (analytical-gp-vars)))
   ([expr vars]
    (normalize-expr
     (let [r (rand)]
@@ -3232,7 +3279,7 @@
     (sync-block-genome
      (case (:strategy ind)
        :analytical
-       (reduce #(mutate-one %1 %2 analytical-vars) ind analytical-expr-keys)
+       (reduce #(mutate-one %1 %2 (analytical-gp-vars)) ind analytical-expr-keys)
        :differential
        (reduce #(mutate-one %1 %2 differential-vars) ind differential-expr-keys)
        :conserved
@@ -3244,7 +3291,7 @@
   [ind]
   (let [strategy (:strategy ind)
         [ks vars] (case strategy
-                    :analytical   [analytical-expr-keys   analytical-vars]
+                    :analytical   [analytical-expr-keys   (analytical-gp-vars)]
                     :differential [differential-expr-keys differential-vars]
                     :conserved    [[conserved-expr-key]   conserved-vars]
                     [nil nil])
@@ -3283,7 +3330,7 @@
 
 (defn- mutate-bound-arm-at-slot [ind k]
   (let [bound (regime-arm-expr (normalize-expr (get ind k)) :bound)
-        mutated (mutate bound analytical-vars)]
+        mutated (mutate bound (analytical-gp-vars))]
     (assoc ind k (slot-with-bound-arm k mutated))))
 
 (defn- guess-mutate-bound-arm [ind k]
@@ -3449,7 +3496,7 @@
   (let [leg      (if (:strategy law) law (law->legacy law))
         strategy (law-kind leg)
         [ks vars] (case strategy
-                    :analytical   [analytical-expr-keys analytical-vars]
+                    :analytical   [analytical-expr-keys (analytical-gp-vars)]
                     :differential [differential-expr-keys differential-vars]
                     :conserved    [[conserved-expr-key] conserved-vars]
                     [nil nil])]
@@ -3473,7 +3520,7 @@
           ind-b    (sync-block-genome ind-b)
           ks       (individual-expr-keys ind-a)
           vars     (case strategy
-                     :analytical   analytical-vars
+                     :analytical   (analytical-gp-vars)
                      :differential differential-vars
                      :conserved    conserved-vars
                      nil)]
@@ -3640,21 +3687,33 @@
     (into (subvec pop 0 (- n ns)) seeds)))
 
 (defn resolve-initial-population
-  [{:keys [fresh? seed? path population-size strategy de-driven? both-regimes?]}]
-  (let [seeds (when seed?
-                (cond
-                  (and de-driven? (= strategy :analytical) both-regimes?)
-                  (both-regimes-analytical-seeds)
+  [{:keys [fresh? seed? path population-size strategy de-driven? both-regimes?
+           pipeline-only?]}]
+  (let [seeds (vec
+               (concat
+                (when (and seed? pipeline-only? de-driven? (= strategy :analytical))
+                  (pipeline-only-seeds))
+                (when seed?
+                  (cond
+                    (and pipeline-only? de-driven? (= strategy :analytical))
+                    []
 
-                  (and de-driven? (= strategy :analytical))
-                  (filterv #(= (:strategy %) :analytical) physics-seeds)
+                    (and de-driven? (= strategy :analytical) both-regimes?)
+                    (both-regimes-analytical-seeds)
 
-                  de-driven?
-                  de-driven-composite-seeds
+                    (and de-driven? (= strategy :analytical))
+                    (filterv #(= (:strategy %) :analytical) physics-seeds)
 
-                  :else
-                  (cond->> physics-seeds
-                    strategy (filterv #(= (:strategy %) strategy)))))
+                    de-driven?
+                    de-driven-composite-seeds
+
+                    (nil? strategy)
+                    de-driven-composite-seeds
+
+                    :else
+                    (cond->> physics-seeds
+                      true (remove #(= (:strategy %) :differential))
+                      strategy (filterv #(= (:strategy %) strategy)))))))
         base  (if fresh?
                 {:population (vec (repeatedly population-size random-individual))
                  :generations-run 0
@@ -3710,7 +3769,8 @@
                :both-regimes? false
                :domain-filter? false
                :primitive-tier :auto
-               :strategy nil}        ; nil = all strategies; or :analytical/:differential/:conserved
+               :primitive-pipeline-only? false
+               :strategy nil}        ; nil = analytical+conserved composite; or :analytical/:conserved
          xs args]
     (if (empty? xs)
       (assoc opts :fitness-context
@@ -3754,6 +3814,9 @@
                          (let [v (first more)]
                            (if (= v "auto") :auto (Long/parseLong v))))
                  (rest more))
+          "--primitive-pipeline-only"
+          (recur (assoc opts :primitive-pipeline-only? true
+                               :primitive-tier primitive-pipeline-tier) more)
           "--mcts-simulations" (recur (assoc opts :mcts-simulations (Long/parseLong (first more))) (rest more))
           "--mcts-inject" (recur (assoc opts :mcts-inject (Long/parseLong (first more))) (rest more))
           "--mcts-repair-simulations" (recur (assoc opts :mcts-repair-simulations (Long/parseLong (first more))) (rest more))
@@ -3763,7 +3826,12 @@
           "--population" (recur (assoc opts :path (first more)) (rest more))
           "--generations" (recur (assoc opts :generations (Long/parseLong (first more))) (rest more))
           "--population-size" (recur (assoc opts :population-size (Long/parseLong (first more))) (rest more))
-          "--strategy" (recur (assoc opts :strategy (keyword (first more))) (rest more))
+          "--strategy" (let [strategy (keyword (first more))]
+                         (when-not (#{:analytical :conserved} strategy)
+                           (throw (ex-info "Unsupported strategy"
+                                           {:strategy strategy
+                                            :allowed #{:analytical :conserved}})))
+                         (recur (assoc opts :strategy strategy) (rest more)))
           (throw (ex-info "Unknown argument"
                           {:arg a
                            :hint "--fresh --de-driven --both-regimes --domain-filter --strategy analytical ..."})))))))
@@ -3858,22 +3926,20 @@
                                                           (mutate-individual parent))))))
                                         unique-elites))))
         repairs     (vec (take immigrant-n repair-immigrants))
-        random-n    (max 0 (- immigrant-n (count repairs)))]
-    (vec (take population-size
-               (concat
-                bred
-                repairs
-                (do
-                  (when (or score-progress? (seq repairs))
-                    (println (format "    %s immigrants (%d%s)..."
-                                     (or gen-label "gen") immigrant-n
-                                     (if (seq repairs)
-                                       (str ", " (count repairs) " MCTS repair")
-                                       "")))
-                    (flush))
-                  (binding [*fast-immigrants?* (or *fast-immigrants?* (> extra-immigrants 5))
-                            *preferred-law-chart* (coords/dominant-chart datasets)]
-                    (repeatedly random-n random-individual))))))))
+        random-n    (max 0 (- immigrant-n (count repairs)))
+        immigrants  (do
+                      (when (or score-progress? (seq repairs))
+                        (println (format "    %s immigrants (%d%s)..."
+                                         (or gen-label "gen") immigrant-n
+                                         (if (seq repairs)
+                                           (str ", " (count repairs) " MCTS repair")
+                                           "")))
+                        (flush))
+                      (binding [*fast-immigrants?* (or *fast-immigrants?* (> extra-immigrants 5))
+                                *preferred-law-chart* (coords/dominant-chart datasets)]
+                        (vec (repeatedly random-n random-individual))))]
+    {:population (vec (take population-size (concat bred repairs immigrants)))
+     :scored scored}))
 
 (defn- prompt-continue-evolution? []
   (print "  Enter = next generation, q = stop and save: ")
@@ -3890,28 +3956,36 @@
                 template-unbound-arms?
                 template-conic-unbound?
                 analytical-blocks?
-                primitive-tier]}
+                primitive-tier
+                primitive-pipeline-only?]}
         (parse-args args)
         de-driven? (= :de-driven (:evaluation fitness-context))
         both-regimes-on? (or both-regimes?
                              (and de-driven? (= strategy :analytical) (not domain-filter?)))
+        pipeline-only-on? (and primitive-pipeline-only? de-driven? (= strategy :analytical))
         mcts-repair-on? (and mcts-repair? de-driven? (= strategy :analytical))
         mcts-mutate-on? (and mcts-mutate? de-driven? (= strategy :analytical))
         template-unbound-on? (and template-unbound-arms? both-regimes-on?
-                                  de-driven? (= strategy :analytical))
+                                  de-driven? (= strategy :analytical)
+                                  (not pipeline-only-on?))
         analytical-blocks-on? (and analytical-blocks? both-regimes-on?
-                                   de-driven? (= strategy :analytical))
+                                   de-driven? (= strategy :analytical)
+                                   (not pipeline-only-on?))
         template-conic-on? (and template-conic-unbound? template-unbound-on?
-                                analytical-blocks-on? (blocks/kepler-conic-valid?))
+                                analytical-blocks-on?)
         report-scenarios default-scenarios
         ref-datasets (scenarios->datasets report-scenarios)
-        preferred-chart (coords/dominant-chart ref-datasets)
+        preferred-chart (if pipeline-only-on?
+                           :cartesian
+                           (coords/dominant-chart ref-datasets))
         primitive-tier-on? (and de-driven? (= strategy :analytical))
-        initial-primitive-tier (if primitive-tier-on?
+        initial-primitive-tier (cond
+                                 pipeline-only-on? primitive-pipeline-tier
+                                 primitive-tier-on?
                                  (if (= primitive-tier :auto)
                                    0
                                    (long primitive-tier))
-                                 0)
+                                 :else 0)
         primitive-tier-atom (atom initial-primitive-tier)]
   (binding [*strategy-filter* strategy
             *guess-mutations?* (if (false? guess-mutations?) false *guess-mutations?*)
@@ -3920,13 +3994,12 @@
             *template-unbound-arms?* template-unbound-on?
             *template-conic-unbound?* template-conic-on?
             *analytical-blocks?* analytical-blocks-on?
+            *primitive-pipeline-only?* pipeline-only-on?
             *primitive-tier* initial-primitive-tier
             *mcts-mutate?* mcts-mutate-on?
             *mcts-mutate-rate* mcts-mutate-rate
             *mcts-mutate-simulations* mcts-mutate-simulations
             *preferred-law-chart* preferred-chart]
-  (when (and de-driven? (= strategy :differential))
-    (println "warning: --strategy differential with --de-driven scores 0 (DE is already known)"))
   (when de-driven?
     (println
      (if (= strategy :analytical)
@@ -3940,7 +4013,7 @@
                             "Taylor unbound template")
                           " + q/p pair mutations"))))
        (if (= strategy :conserved)
-         "Each individual: analytical laws + conserved laws (composite; min fitness)"
+         "Each individual: conserved laws only (invariance along orbits)"
          "Each individual: analytical laws (motion DE) + conserved laws (invariants along orbits, not DE solutions)"))))
   (when (and mcts-repair-on? de-driven? (= strategy :analytical))
     (println (str "MCTS adversarial repair: up to " mcts-repair-inject
@@ -3955,13 +4028,16 @@
   (when analytical-blocks-on?
     (println (str "Analytical blocks (Emmy-validated): "
                   (blocks/catalog-block-count)
-                  " catalog laws + kepler-conic inject"
+                  " catalog laws"
                   " — circle, ellipse, harmonic, conic (sinh/cosh)")))
   (when (and primitive-tier-on? (pos? initial-primitive-tier))
     (println (str "Graded primitives: tier " initial-primitive-tier
                   " — " (clojure.string/join ", " (map name (prims/unlocked-primitive-ops initial-primitive-tier))))))
-  (when (and primitive-tier-on? (= primitive-tier :auto))
+  (when (and primitive-tier-on? (= primitive-tier :auto) (not pipeline-only-on?))
     (println "Graded primitives: tier auto (unlocks with hall-of-fame fitness)"))
+  (when pipeline-only-on?
+    (println (str "Primitive pipeline only: tier " primitive-pipeline-tier
+                  ", oracle leaves banned (ecc-anom/hyp-anom/mean-M/peri-xp/yp), no conic catalog/template")))
   (let [{:keys [population generations-run resumed?]}
         (resolve-initial-population {:fresh? fresh?
                                      :seed?  seed?
@@ -3969,7 +4045,8 @@
                                      :population-size population-size
                                      :strategy strategy
                                      :de-driven? de-driven?
-                                     :both-regimes? both-regimes-on?})
+                                     :both-regimes? both-regimes-on?
+                                     :pipeline-only? pipeline-only-on?})
         initial (normalize-population-size population population-size)
         fit-opts (select-keys fitness-context [:aggregate :percentile :evaluation])
         eval-phase-states (when de-driven?
@@ -4077,25 +4154,27 @@
                                                  (catch Throwable e
                                                    (println "  warning: MCTS repair failed:" (.getMessage e))
                                                    [])))
-                           pop' (binding [*stagnation-escape?* (or escape-burst? escape-deep?)
-                                          *fast-breeding?* (or escape-burst? escape-deep?)
-                                          *fast-immigrants?* (or escape-burst? escape-deep?)
-                                          *primitive-tier* @primitive-tier-atom
-                                          *fitness-timeout-ms* (when (or escape-burst? escape-deep?)
-                                                                 90000)]
-                                  (evolve-generation pop-for-breed fitness-context population-size gen-idx
-                                                     :extra-immigrants extra-imm
-                                                     :elite-divisor elite-divisor
-                                                     :behavior-probes behavior-probes-lite
-                                                     :behavior-diverse-elites? false
-                                                     :behavior-cache behavior-cache
-                                                     :score-progress? (or escape-burst? escape-deep?)
-                                                     :repair-immigrants (or repair-immigrants [])
-                                                     :gen-label (format "gen %d" (inc gen-idx))))
+                           gen-result (binding [*stagnation-escape?* (or escape-burst? escape-deep?)
+                                                *fast-breeding?* (or escape-burst? escape-deep?)
+                                                *fast-immigrants?* (or escape-burst? escape-deep?)
+                                                *primitive-tier* @primitive-tier-atom
+                                                *fitness-timeout-ms* (when (or escape-burst? escape-deep?)
+                                                                       90000)]
+                                          (evolve-generation pop-for-breed fitness-context population-size gen-idx
+                                                             :extra-immigrants extra-imm
+                                                             :elite-divisor elite-divisor
+                                                             :behavior-probes behavior-probes-lite
+                                                             :behavior-diverse-elites? false
+                                                             :behavior-cache behavior-cache
+                                                             :score-progress? (or escape-burst? escape-deep?)
+                                                             :repair-immigrants (or repair-immigrants [])
+                                                             :gen-label (format "gen %d" (inc gen-idx))))
+                           pop'   (:population gen-result)
+                           scored (:scored gen-result)
                            gens (+ generations-run (inc gen-idx))
-                           {:keys [best mean median]} (population-fitness-stats pop')
+                           {:keys [best mean median]} (population-fitness-stats scored)
                            ;; Re-eval top training elites on fixed reference scenarios (not whole pop).
-                           elite-inds (->> pop' (sort-by :fitness #(compare %2 %1)) (take 5))
+                           elite-inds (take 5 scored)
                            eval-timeout (when (or escape-burst? escape-deep?) 90000)
                            eval-pairs (keep (fn [ind]
                                               (let [s (call-with-timeout
@@ -4115,7 +4194,9 @@
                                         (or (nil? @hall-of-fame)
                                             (> eval-best (:eval-fitness @hall-of-fame))))
                                (reset! hall-of-fame {:ind best-eval-ind :eval-fitness eval-best}))
-                           _ (when (and primitive-tier-on? (= primitive-tier :auto))
+                           _ (when (and primitive-tier-on?
+                                        (= primitive-tier :auto)
+                                        (not pipeline-only-on?))
                                (reset! primitive-tier-atom
                                        (prims/primitive-tier-for-hof
                                         (or (:eval-fitness @hall-of-fame) eval-best 0.0))))

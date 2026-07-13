@@ -276,11 +276,23 @@
 
 (deftest de-driven-composite-individual
   (binding [*de-driven-search?* true
-            *strategy-filter* :conserved]
+            *strategy-filter* nil]
     (let [ind (random-individual)
           kinds (set (individual-law-kinds ind))]
       (is (= 2 (count (individual-laws ind))))
       (is (= #{:analytical :conserved} kinds)))))
+
+(deftest default-random-individual-is-analytical-plus-conserved
+  (binding [*strategy-filter* nil]
+    (let [ind (random-individual)]
+      (is (= [:analytical :conserved] (individual-law-kinds ind)))
+      (is (genome-valid? ind)))))
+
+(deftest differential-strategy-is-not-a-cli-option
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"Unsupported strategy"
+       (parse-args ["--strategy" "differential"]))))
 
 (deftest de-driven-analytical-taylor-beats-trig
   (let [ctx (make-fitness-context :evaluation :de-driven :phase-samples 32 :seed 2)

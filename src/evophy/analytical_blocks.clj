@@ -54,21 +54,21 @@
 
    (law :ellipse-conic "Elliptic conic: a(cos u−e), b sin u rotated by ω"
         :bound #{:ellipse :conic :trig :closed}
-        '{:qx-expr (- (* cos-om (* semi-a (- (e/cos kepler-u) ecc)))
-                      (* sin-om (* semi-b (e/sin kepler-u))))
-          :qy-expr (+ (* sin-om (* semi-a (- (e/cos kepler-u) ecc)))
-                      (* cos-om (* semi-b (e/sin kepler-u))))
-          :px-expr (* m (- (* kepler-vxp cos-om) (* kepler-vyp sin-om)))
-          :py-expr (* m (+ (* kepler-vxp sin-om) (* kepler-vyp cos-om)))})
+        '{:qx-expr (- (* cos-om (* semi-a (- (e/cos ecc-anom) ecc)))
+                      (* sin-om (* semi-b (e/sin ecc-anom))))
+          :qy-expr (+ (* sin-om (* semi-a (- (e/cos ecc-anom) ecc)))
+                      (* cos-om (* semi-b (e/sin ecc-anom))))
+          :px-expr (* m (- (* peri-vxp cos-om) (* peri-vyp sin-om)))
+          :py-expr (* m (+ (* peri-vxp sin-om) (* peri-vyp cos-om)))})
 
    (law :hyperbola-conic "Hyperbolic conic: a(e−cosh F), b_h sinh F rotated by ω"
         :unbound #{:hyperbola :conic :sinh :open}
-        '{:qx-expr (- (* cos-om (* semi-a (- ecc (e/cosh kepler-F))))
-                      (* sin-om (* bh (e/sinh kepler-F))))
-          :qy-expr (+ (* sin-om (* semi-a (- ecc (e/cosh kepler-F))))
-                      (* cos-om (* bh (e/sinh kepler-F))))
-          :px-expr (* m (- (* kepler-vxp cos-om) (* kepler-vyp sin-om)))
-          :py-expr (* m (+ (* kepler-vxp sin-om) (* kepler-vyp cos-om)))})])
+        '{:qx-expr (- (* cos-om (* semi-a (- ecc (e/cosh hyp-anom))))
+                      (* sin-om (* bh (e/sinh hyp-anom))))
+          :qy-expr (+ (* sin-om (* semi-a (- ecc (e/cosh hyp-anom))))
+                      (* cos-om (* bh (e/sinh hyp-anom))))
+          :px-expr (* m (- (* peri-vxp cos-om) (* peri-vyp sin-om)))
+          :py-expr (* m (+ (* peri-vxp sin-om) (* peri-vyp cos-om)))})])
 
 (def ^:private taylor-unbound-slots
   "First-order Taylor unbound arms — legacy template default."
@@ -89,22 +89,6 @@
   "Unbound-arm slot map for :hyperbola-conic (nil when entry missing)."
   []
   (:slots (catalog-entry :hyperbola-conic)))
-
-(defn kepler-conic-entry
-  "Synthetic both-regimes entry: :ellipse-conic bound + :hyperbola-conic unbound."
-  []
-  (when-let [ell (catalog-entry :ellipse-conic)]
-    (when-let [hyp (catalog-entry :hyperbola-conic)]
-      {:id :kepler-conic
-       :label "Kepler conic: elliptic (sin/cos u) bound + hyperbolic (sinh/cosh F) unbound"
-       :regime :any
-       :tags #{:kepler :conic}
-       :bound-slots (:slots ell)
-       :unbound-slots (:slots hyp)})))
-
-(defn kepler-conic-valid?
-  []
-  (boolean (kepler-conic-entry)))
 
 (defn regime->domain [regime]
   (case regime
@@ -168,10 +152,3 @@
     (graft-bound-pair leg entry pair)))
 
 (defn catalog-block-count []  (count validated-catalog))
-
-(defn injection-catalog-entries
-  "Validated single-regime entries plus optional synthetic :kepler-conic."
-  []
-  (if-let [kc (kepler-conic-entry)]
-    (conj validated-catalog kc)
-    validated-catalog))
