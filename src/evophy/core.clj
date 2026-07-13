@@ -1856,10 +1856,7 @@
 (defn random-analytical-individual
   ([] (random-analytical-individual (or *preferred-law-chart* :cartesian)))
   ([chart]
-   (or (when (and (primitive-pipeline-only-active?) (< (rand) 0.0))
-         (let [ind (graded-pipeline-analytical-individual)]
-           (when (analytical-genome-valid? ind) ind)))
-       (if (and (analytical-blocks-active?) (= chart :cartesian) (< (rand) 0.45))
+   (if (and (analytical-blocks-active?) (= chart :cartesian) (< (rand) 0.45))
      (catalog-law-as-individual)
      (let [chart    (keyword chart)
          keys     (coords/analytical-expr-keys-for-chart chart)
@@ -1896,7 +1893,7 @@
            (cond-> (= chart :polar) ensure-t))
       keys
       required
-      analytical-genome-valid?))))))
+      analytical-genome-valid?)))))
 
 (defn- pipeline-only-seeds []
   [(laws-individual [(graded-pipeline-analytical-individual)])])
@@ -2360,16 +2357,31 @@
                     {:strategy *strategy-filter*
                      :allowed #{:analytical :conserved}}))))
 
+(declare mutate-individual)
+
 (defn- escape-deep-reseed-population
-  "Full population for [escape+]: cycle validated catalog laws (strict template), else random."
-  [n]
-  (if (and (= *strategy-filter* :analytical) (analytical-blocks-active?))
+  "Full population for [escape+]: cycle validated catalog laws (strict template) when
+   available; otherwise half random immigrants and half mutated variants of the current
+   hall-of-fame (1-4 mutation passes each) so deep escape explores basins near the known
+   optimum instead of only ever re-rolling pure random genomes with no bias at all."
+  [n hof-ind]
+  (cond
+    (and (= *strategy-filter* :analytical) (analytical-blocks-active?))
     (let [entries (vec blocks/validated-catalog)
           inds (mapv #(laws-individual [(law-from-legacy (strict-catalog-law-from-entry %))])
                      entries)]
       (if (seq inds)
         (vec (take n (cycle inds)))
         (vec (repeatedly n random-individual))))
+
+    hof-ind
+    (let [n-mutants (quot n 2)
+          n-random  (- n n-mutants)
+          mutate-n-times (fn [ind k] (nth (iterate mutate-individual ind) k))]
+      (into (vec (repeatedly n-mutants #(mutate-n-times hof-ind (inc (rand-int 4)))))
+            (repeatedly n-random random-individual)))
+
+    :else
     (vec (repeatedly n random-individual))))
 
 ;; ── Physics seeds ─────────────────────────────────────────────────────────────
@@ -4068,11 +4080,17 @@
                        (if resumed? "(resuming)" "(new checkpoint file)")))
         ;; Fixed reference datasets used only for stable per-generation eval — never for selection.
         ;; Hall-of-fame: best individual ever seen by eval fitness. Injected every generation
-        ;; so it can never be lost to random-batch variance.
-        hall-of-fame  (atom nil)
-        ;; Stagnation tracking: count consecutive gens without HoF improvement.
-        stagnation    (atom 0)
-        escape-stagnation (atom 0) ; flat HoF while in [escape] burst mode
+        ;; so it can never be lost to random-batch variance. Fitness (not :ind — not persisted)
+        ;; is seeded from history on resume, so gen 1 doesn't look like a false "improvement"
+        ;; against a reset baseline of 0.0 and wipe out the seeded stagnation counters below.
+        ;; :ind is filled in as soon as a real individual matches or beats this seeded fitness.
+        last-history-entry (last @history)
+        hall-of-fame  (atom (when-let [hof-best (:hof-best last-history-entry)]
+                              {:eval-fitness hof-best}))
+        ;; Stagnation tracking: count consecutive gens without HoF improvement. Seeded from the
+        ;; last history entry so escalation survives a resume instead of resetting to 0 every run.
+        stagnation    (atom (long (or (:stagnation last-history-entry) 0)))
+        escape-stagnation (atom (long (or (:escape-stagnation last-history-entry) 0))) ; flat HoF while in [escape] burst mode
         stagnation-threshold 20   ; gens of flat HoF before escape mode
         stagnation-burst-threshold 50 ; gens before aggressive pool shake-up
         escape-deep-threshold 25  ; [escape] gens without HoF gain → near-full reseed
@@ -4104,7 +4122,7 @@
                                               escape-deep? 20
                                               escape-burst? 10
                                               :else 5)
-                           hof-gk           (when (and escape-burst? @hall-of-fame)
+                           hof-gk           (when (and escape-burst? (:ind @hall-of-fame))
                                               (individual-genome-key (:ind @hall-of-fame)))
                            _ (when escape-deep?
                                (println (if (and (= strategy :analytical) (analytical-blocks-active?))
@@ -4115,7 +4133,7 @@
                            pop-diverse      (binding [*fast-immigrants?* (or escape-burst? escape-deep?)]
                                               (cond
                                                 escape-deep?
-                                                (escape-deep-reseed-population population-size)
+                                                (escape-deep-reseed-population population-size (:ind @hall-of-fame))
 
                                                 escape-burst?
                                                 (let [without-basin (if hof-gk
@@ -4135,7 +4153,7 @@
                                                            (into v (repeatedly (- population-size (count v))
                                                                                random-individual))
                                                            (vec (take population-size v))))]
-                                              (if (and @hall-of-fame (not escape-deep?))
+                                              (if (and (:ind @hall-of-fame) (not escape-deep?))
                                                 (assoc base (dec population-size) (:ind @hall-of-fame))
                                                 base))
                            repair-n (when mcts-repair-on?
@@ -4145,7 +4163,7 @@
                                         escape? (max mcts-repair-inject 2)
                                         stagnating? mcts-repair-inject
                                         :else mcts-repair-inject))
-                           repair-source (when (and repair-n @hall-of-fame)
+                           repair-source (when (and repair-n (:ind @hall-of-fame))
                                            (:ind @hall-of-fame))
                            repair-immigrants (when (and repair-n repair-source)
                                                (try
@@ -4211,7 +4229,9 @@
                        (swap! history conj {:gen (inc gen-idx) :total-gen gens
                                             :best best :mean mean :median median
                                             :eval-best eval-best
-                                            :hof-best (:eval-fitness @hall-of-fame)})
+                                            :hof-best (:eval-fitness @hall-of-fame)
+                                            :stagnation @stagnation
+                                            :escape-stagnation @escape-stagnation})
                        (save-history! history-path @history)
                        (println (format "  gen %d/%d  train-best=%.4f  eval-best=%.4f  hof=%.4f  mean=%.4f%s  saved"
                                         (inc gen-idx) generations best
