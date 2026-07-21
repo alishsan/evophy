@@ -48,12 +48,31 @@ pointing search at open problems.
     wants one number. `score-strategy` runs a whole procedure and scores its
     spectrum + reported work end-to-end.
 
-Run the validation and the fitness demo:
+- **`search.clj`** — the search layer (roadmap item 3). A fresh, small GP
+  loop over trial-ψ expression trees, reusing only the classical branch's
+  *pattern* (truncation elitism + mutation/crossover + immigrants), not any
+  of its Kepler code:
+  - **Genome** — a single s-expression over `x` (plus the potential `V`
+    itself, passed in as a live argument so a compiled fn is valid for any
+    benchmark), with a small generic op set (`+ - * qdiv`, `qexp qneg
+    qsquare qabs qsqrt qsin qcos`, `V`) — no orbital primitives.
+  - **Fitness is oracle-free** — scores against `fitness.clj`'s
+    `variational-fitness` (Rayleigh quotient), a rigorous upper bound on the
+    true energy, so search climbs toward truth using only the potential and
+    the variational principle, never the answer. Excited states come from
+    sequential Gram-Schmidt deflation (`project-out`) against the levels
+    already found.
+  - `evolve-level` searches one level; `evolve-spectrum` chains levels
+    bottom-up. On the harmonic oscillator this rediscovers the exact ground
+    and first-excited states (`exp(-V(x))`, `x*exp(-V(x))`) from scratch.
+
+Run the validation and the search/fitness demos:
 
 ```bash
 lein run -m evophy.qm.schrodinger    # oracle benchmarks
 lein run -m evophy.qm.fitness        # scoring demo on the harmonic oscillator
-lein test evophy.qm.schrodinger-test evophy.qm.fitness-test
+lein run -m evophy.qm.search         # GP search discovers E_0..E_2 from scratch
+lein test evophy.qm.schrodinger-test evophy.qm.fitness-test evophy.qm.search-test
 ```
 
 ## Roadmap
@@ -68,10 +87,14 @@ lein test evophy.qm.schrodinger-test evophy.qm.fitness-test
    **Done.** See `fitness.clj`: partial-credit energy/spectrum scores,
    oracle-free variational objective (Rayleigh quotient + orthogonal
    projection), wavefunction fidelity, and Pareto accuracy-vs-cost.
-3. **Search layer** — GP over trial-ψ expression trees and/or procedural
+3. ~~**Search layer** — GP over trial-ψ expression trees and/or procedural
    refinement strategies (Newton on the boundary residual, variational
    trial functions, shooting-step rules). Reuse philosophy from the classical
-   branch, not its Kepler-specific primitives.
+   branch, not its Kepler-specific primitives.~~ **Done** (first pass). See
+   `search.clj`: variational (oracle-free) GP over trial-ψ trees, ground
+   state + sequential deflation for excited states. Not yet explored:
+   procedural refinement strategies, and pointing the search at Woods-Saxon
+   (no closed form to validate against, but nothing stops it from running).
 
 Nothing from the classical `evophy.core` pipeline (phase-space representation,
 orbital primitives, coordinate charts) transfers directly — this is a fresh
