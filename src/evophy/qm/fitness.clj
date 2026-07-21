@@ -149,9 +149,16 @@
   Uses the gradient form of the kinetic term,
   <psi|T|psi> = (hbar^2/2m) integral (psi')^2 dx, discretized with
   forward differences (equivalent to psi^T K psi for the standard tridiagonal
-  Laplacian and always >= 0). Dirichlet boundaries (psi -> 0) are assumed, as
-  for any bound state. The result is a rigorous upper bound on the ground-state
-  energy of V; the tighter (lower) it is, the better the trial.
+  Laplacian and always >= 0). Dirichlet boundaries (psi -> 0 just outside the
+  grid) are assumed, as for any bound state, and are enforced explicitly via
+  two boundary terms (psi[0]-0)^2/h and (psi[n-1]-0)^2/h -- without them a
+  trial that fails to decay at the grid edge (e.g. a nonzero constant on the
+  infinite-well benchmark, whose domain IS the hard wall) would dodge the
+  kinetic cost of that discontinuity and can spuriously undercut the true
+  ground energy. For potentials with padding beyond where a good trial decays
+  (harmonic, finite/Woods-Saxon wells) these two terms are negligible. The
+  result is a rigorous upper bound on the ground-state energy of V; the
+  tighter (lower) it is, the better the trial.
 
   `psi` is a fn of x or a grid vector."
   ^double [params psi]
@@ -161,12 +168,15 @@
         h   (s/step-size params)
         n   (count p)
         kin-c (/ (* hbar hbar) (* 2.0 m))
-        ;; kinetic: (hbar^2/2m) * sum ((p[i+1]-p[i])^2 / h)
+        ;; kinetic: (hbar^2/2m) * sum ((p[i+1]-p[i])^2 / h), plus the two
+        ;; Dirichlet boundary terms treating psi as 0 just outside the grid.
         kin (loop [i 0 s 0.0]
               (if (< i (dec n))
                 (let [d (- (double (nth p (inc i))) (double (nth p i)))]
                   (recur (inc i) (+ s (/ (* d d) h))))
-                (* kin-c s)))
+                (let [p0 (double (nth p 0))
+                      pn (double (nth p (dec n)))]
+                  (* kin-c (+ s (/ (* p0 p0) h) (/ (* pn pn) h))))))
         ;; potential + norm via trapezoidal
         [pot nrm] (loop [i 0 pv 0.0 nv 0.0]
                     (if (< i n)

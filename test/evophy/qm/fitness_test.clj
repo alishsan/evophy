@@ -90,6 +90,20 @@
       (is (>= energy 1.49) "bound sits at/above the true E_1 = 1.5")
       (is (< energy 2.0)   "and a decent odd trial gets reasonably close"))))
 
+(deftest rayleigh-enforces-dirichlet-boundary-at-a-hard-wall
+  (testing "on the infinite well, the grid edge IS the wall -- a trial that
+           doesn't vanish there must pay a real kinetic cost, not dodge it"
+    (let [params (:params (s/infinite-well {:L 1.0}))
+          exact-E0 4.934802200544679
+          flat  (fn [_] 1.0)                       ;; violates psi(0)=psi(L)=0
+          nodal (fn [x] (Math/sin (* Math/PI x)))]  ;; satisfies it exactly
+      (is (>= (f/rayleigh-quotient params flat) exact-E0)
+          "even a trivial trial can't score below the true ground energy")
+      (is (> (f/rayleigh-quotient params flat) 100.0)
+          "the boundary discontinuity carries a large, not negligible, cost")
+      (is (< (Math/abs (- (f/rayleigh-quotient params nodal) exact-E0)) 1e-5)
+          "a trial that already vanishes at both walls is unaffected"))))
+
 (deftest variational-fitness-higher-is-better
   (testing "fitness increases as the trial energy decreases"
     (let [params (:params (s/harmonic {:omega 1.0 :x-max 12.0 :n 2001}))
