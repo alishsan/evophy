@@ -48,6 +48,19 @@ pointing search at open problems.
     wants one number. `score-strategy` runs a whole procedure and scores its
     spectrum + reported work end-to-end.
 
+- **`matrix.clj`** — a second, independent oracle: finite-difference
+  Hamiltonian + dense diagonalization (hand-rolled cyclic Jacobi rotations,
+  pure Clojure, same no-dependency constraint as `schrodinger.clj`), instead
+  of Numerov + shooting. Exists purely to cross-validate `schrodinger.clj` —
+  a bug in the only oracle would silently poison the fitness layer and
+  everything the search climbs toward. Same `solve`/`spectrum`/
+  `benchmark-report` shape as the shooting solver, reusing its benchmark
+  potentials and closed forms directly. O(n^3) diagonalization means much
+  smaller grids (hundreds of points, not thousands) and looser tolerances at
+  the finite well's discontinuous edge (O(h^2) stencil vs. Numerov's O(h^4)),
+  but on Woods-Saxon — no closed form to check either against — the two
+  methods agree to a few percent, which is the actual point of having both.
+
 - **`search.clj`** — the search layer (roadmap item 3). A fresh, small GP
   loop over trial-ψ expression trees, reusing only the classical branch's
   *pattern* (truncation elitism + mutation/crossover + immigrants), not any
@@ -70,9 +83,10 @@ Run the validation and the search/fitness demos:
 
 ```bash
 lein run -m evophy.qm.schrodinger    # oracle benchmarks
+lein run -m evophy.qm.matrix         # second oracle: matrix vs closed forms + shooting solver
 lein run -m evophy.qm.fitness        # scoring demo on the harmonic oscillator
 lein run -m evophy.qm.search         # GP search discovers E_0..E_2 from scratch
-lein test evophy.qm.schrodinger-test evophy.qm.fitness-test evophy.qm.search-test
+lein test evophy.qm.schrodinger-test evophy.qm.matrix-test evophy.qm.fitness-test evophy.qm.search-test
 ```
 
 ## Roadmap
